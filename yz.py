@@ -1,176 +1,151 @@
-import akshare as ak
+import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-import os
-import json
+import akshare as ak
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+from datetime import datetime, timedelta, timezone
 
-# ====================== 配置 ======================
-CONSECUTIVE_YANG = 3
-VOL_MULTIPLIER = 2.0
-VOL_PERIOD = 5
-ZT_THRESHOLD = 0.099
-RECENT_DAYS = 10
-MAX_THREADS = 10          # 降低并发，避免被限流
-CACHE_FILE = "main_board_cache.json"  # 股票列表缓存
-CACHE_EXPIRE_HOURS = 6    # 缓存有效期
+# --- 1. 配置与安全 ---
+st.set_page_config(page_title="游资核心标的追踪-全市场活跃版", layout="wide")
 
-# ====================== 工具函数 ======================
-def is_up_limit(prev_close, today_close):
-    if prev_close <= 0:
-        return False
-    return (today_close - prev_close) / prev_close >= ZT_THRESHOLD
-
-def has_gap_up(df):
-    for i in range(1, len(df)):
-        if df['low'].iloc[i] > df['high'].iloc[i-1]:
-            return True
-    return False
-
-def load_or_fetch_main_board():
-    """带缓存的获取主板股票列表"""
-    now = datetime.now()
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            cache_time = datetime.fromisoformat(data['timestamp'])
-            if (now - cache_time).total_seconds() / 3600 < CACHE_EXPIRE_HOURS:
-                print(f"使用缓存股票列表（{len(data['codes'])}只），更新于 {cache_time}")
-                return data['codes']
-
-    print("正在获取主板股票列表（可能需要10-60秒）...")
-    for attempt in range(3):
-        try:
-            stock_list = ak.stock_zh_a_spot_em()
-            # 过滤逻辑（剔除ST/创业/科创/北交）
-            stock_list = stock_list[~stock_list['名称'].str.contains("ST|退市", na=False)]
-            condition = (
-                (stock_list['代码'].str.startswith(('60', '000', '001', '002', '003'))) & 
-                (~stock_list['代码'].str.startswith(('30', '688', '8', '43')))
-            )
-            df_main = stock_list[condition].copy()
-            df_main['代码'] = df_main['代码'].astype(str).str.zfill(6)
-            codes = df_main['代码'].tolist()
-
-            # 保存缓存
-            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'timestamp': now.isoformat(),
-                    'codes': codes
-                }, f, ensure_ascii=False)
-
-            print(f"成功获取 {len(codes)} 只主板非ST股票")
-            return codes
-        except Exception as e:
-            print(f"尝试 {attempt+1}/3 失败: {e}")
-            time.sleep(5)
-    raise Exception("获取股票列表失败，请检查网络或稍后再试")
-
-def screen_stock(code):
-    try:
-        # 动态往前30-40天
-        start_str = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=start_str,
-                                end_date=datetime.now().strftime("%Y%m%d"),
-                                adjust="qfq")
-        
-        if len(df) < 12:
-            return False, None
-
-        df = df.tail(15).copy()
-        for col in ['收盘', '开盘', '最高', '最低', '成交量']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna(subset=['收盘','开盘','最高','最低','成交量'])
-        if len(df) < VOL_PERIOD + 2:
-            return False, None
-
-        df.rename(columns={'收盘':'close', '开盘':'open', '最高':'high', 
-                           '最低':'low', '成交量':'volume', '日期':'date'}, inplace=True)
-
-        # ① 最近涨停
-        has_zt = False
-        zt_date = None
-        for i in range(1, min(RECENT_DAYS+1, len(df))):
-            if is_up_limit(df['close'].iloc[i-1], df['close'].iloc[i]):
-                has_zt = True
-                zt_date = df['date'].iloc[i]
-                break
-        if not has_zt:
-            return False, None
-
-        # ② 连续阳线
-        yang_count = 0
-        for i in range(1, CONSECUTIVE_YANG + 1):
-            if i >= len(df): break
-            if df['close'].iloc[-i] > df['open'].iloc[-i]:
-                yang_count += 1
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+    if not st.session_state["password_correct"]:
+        pwd = st.text_input("请输入访问令牌", type="password")
+        if st.button("验证登录"):
+            target_pwd = st.secrets.get("ACCESS_PASSWORD", "888888")
+            if pwd == target_pwd:
+                st.session_state["password_correct"] = True
+                st.rerun()
             else:
-                break
-        if yang_count < CONSECUTIVE_YANG:
-            return False, None
+                st.error("令牌错误")
+        return False
+    return True
 
-        # ③ 缺口（最近8天）
-        if not has_gap_up(df.tail(8)):
-            return False, None
+# --- 2. 核心判定逻辑 ---
+def get_beijing_time():
+    """获取北京时间"""
+    tz = timezone(timedelta(hours=8))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-        # ④ 量放大
-        recent_vol = df['volume'].iloc[-1]
-        prev_mean = df['volume'].iloc[-1-VOL_PERIOD:-1].mean()
-        if recent_vol < prev_mean * VOL_MULTIPLIER:
-            return False, None
-
-        # 命中
-        name = "未知"
-        try:
-            info_df = ak.stock_individual_info_em(symbol=code)
-            if not info_df.empty and 'value' in info_df.columns:
-                name = info_df['value'].iloc[0]
-        except:
-            pass
-
-        return True, {
-            '代码': code,
-            '名称': name,
-            '涨停日期': zt_date,
-            '连续阳线': yang_count,
-            '最新收盘': round(df['close'].iloc[-1], 2),
-            '最新量': int(recent_vol),
-            '前{}日均量'.format(VOL_PERIOD): round(prev_mean, 0)
+def process_single_stock(code, name, current_price, turnover_rate, sector_info):
+    try:
+        # 获取判定所需的天数（8天用于判定是否超过7连阳）
+        hist = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(8)
+        if hist is None or len(hist) < 5: return None
+        
+        # --- 封顶剔除逻辑：超过7连阳的剔除 ---
+        if len(hist) == 8:
+            is_8_positive = (hist['收盘'] > hist['开盘']).all()
+            if is_8_positive:
+                return None
+        
+        hist_7 = hist.tail(7)
+        
+        def check_logic(data, days, max_gain):
+            sub_data = data.tail(days)
+            if len(sub_data) < days: return False, 0
+            is_positive = (sub_data['收盘'] > sub_data['开盘']).all()
+            total_gain = (sub_data.iloc[-1]['收盘'] - sub_data.iloc[0]['开盘']) / sub_data.iloc[0]['开盘'] * 100
+            return is_positive and total_gain <= max_gain, round(total_gain, 2)
+        
+        # --- 三重判定逻辑 ---
+        match7, gain7 = check_logic(hist_7, 7, 22.5)
+        if match7:
+            res_type, res_gain = "🔥 7连阳/≤22.5%", gain7
+        else:
+            match6, gain6 = check_logic(hist_7, 6, 17.5)
+            if match6:
+                res_type, res_gain = "⭐ 6连阳/≤17.5%", gain6
+            else:
+                match5, gain5 = check_logic(hist_7, 5, 12.5)
+                if match5:
+                    res_type, res_gain = "⚡ 5连阳/≤12.5%", gain5
+                else:
+                    return None
+        
+        return {
+            "代码": code,
+            "名称": name,
+            "当前价格": current_price,
+            "今日换手率": f"{turnover_rate}%",
+            "判定强度": res_type,
+            "累计涨幅": f"{res_gain}%",
+            "所属板块": sector_info,
+            "查询时间(北京)": get_beijing_time()
         }
+    except:
+        return None
 
-    except Exception:
-        return False, None
-
-
-if __name__ == "__main__":
-    codes = load_or_fetch_main_board()
-
-    result_list = []
-    lock = threading.Lock()
-
-    print(f"\n开始多线程扫描 {len(codes)} 只股票（线程数: {MAX_THREADS}）...")
-
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(screen_stock, code): code for code in codes}
-        for future in tqdm(as_completed(futures), total=len(codes), desc="扫描进度"):
-            match, info = future.result()
-            if match:
-                with lock:
-                    result_list.append(info)
-                    print(f"【命中】 {info['代码']} {info['名称']}")
-
-    if result_list:
-        df_result = pd.DataFrame(result_list)
-        today = datetime.now().strftime("%Y%m%d")
-        filename = f"涨停前四信号_{today}.csv"
-        df_result.to_csv(filename, index=False, encoding="utf_8_sig")
-        print(f"\n完成！共找到 {len(result_list)} 只符合股票")
-        print("结果已保存:", filename)
-        print(df_result)
-    else:
-        print("\n今天没有同时满足4个特征的股票")
+# --- 3. 页面渲染 ---
+if check_password():
+    st.title("🚀 游资核心追踪 (全市场活跃主板版)")
+    with st.spinner("同步实时数据..."):
+        all_sectors = ak.stock_board_industry_name_em()['板块名称'].tolist()
+    selected_sector = st.sidebar.selectbox("选择查询范围", ["全市场扫描"] + all_sectors)
+    thread_count = st.sidebar.slider("并发线程数", 1, 30, 20)
+    
+    if st.button("开启全速扫描"):
+        countdown = st.empty()
+        for i in range(3, 0, -1):
+            countdown.metric("极速引擎正在预热...", f"{i} 秒")
+            time.sleep(1)
+        countdown.empty()
+        with st.spinner("正在筛选活跃主板标的池..."):
+            if selected_sector == "全市场扫描":
+                df_pool = ak.stock_zh_a_spot_em()
+            else:
+                df_pool = ak.stock_board_industry_cons_em(symbol=selected_sector)
+            # --- 核心筛选与剔除 ---
+            # 1. 剔除 ST/退市/非主板
+            df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
+            df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "688", "9"))]
+            
+            # 2. 新增：换手率大于或等于 5% (AkShare字段名为'换手率')
+            df_pool = df_pool[df_pool['换手率'] >= 5.0]
+        stocks_to_check = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
+        total_stocks = len(stocks_to_check)
+        
+        st.write(f"📊 主板活跃标的(换手率≥5%)：{total_stocks} 只")
+        
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        results = []
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            # 传入参数增加换手率 s[3]
+            future_to_stock = {executor.submit(process_single_stock, s[0], s[1], s[2], s[3], selected_sector): s for s in stocks_to_check}
+            
+            for i, future in enumerate(as_completed(future_to_stock)):
+                res = future.result()
+                if res:
+                    results.append(res)
+                    st.toast(f"✅ 捕获高活跃股: {res['名称']}")
+                
+                curr_p = float(min((i + 1) / total_stocks, 1.0))
+                progress_bar.progress(curr_p)
+                if (i + 1) % 20 == 0:
+                    status_text.text(f"🚀 扫描中... 进度: {i+1}/{total_stocks}")
+        duration = round(time.time() - start_time, 2)
+        status_text.success(f"✨ 扫描完成！耗时 {duration} 秒")
+        if results:
+            res_df = pd.DataFrame(results)
+            # 重新排列列顺序，换手率放在价格后
+            cols = ["代码", "名称", "当前价格", "今日换手率", "判定强度", "累计涨幅", "所属板块", "查询时间(北京)"]
+            res_df = res_df[cols]
+            
+            st.dataframe(res_df, use_container_width=True)
+            output = io.BytesIO()
+            res_df.to_excel(output, index=False)
+            st.download_button(
+                label="📥 导出活跃结果 (Excel)",
+                data=output.getvalue(),
+                file_name=f"活跃精选_{get_beijing_time()[:10]}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("暂无符合条件的活跃标的。")
+    st.divider()
+    st.caption("Master Copy | 全市场活跃主板 | 换手率≥5% | 5-7连阳控幅")
