@@ -1,276 +1,167 @@
-# yp.py
-# 游资突击扫描器 - Streamlit 版
-# 包含：板块多选 + 线程数调节 + 三重连阳判定逻辑
-# 最后更新：2026-01
+# -*- coding: utf-8 -*-
+"""
+大涨前4信号同时出现扫描器
+核心特征：
+1. 近期出现涨停（或接近涨停 ≥9.5%）
+2. 连续阳线（至少3~5根连续阳线）
+3. 存在向上跳空缺口（近10~20天内）
+4. 成交量明显放大（最近一天量比>3 或 近3天平均换手>前10天3倍以上）
 
-import sys
-import traceback
+2025-2026短线主流思路简化版
+"""
+
+import akshare as ak
+import pandas as pd
+from datetime import datetime, timedelta
 import warnings
-warnings.filterwarnings("ignore")
 
-try:
-    import streamlit as st
-    import akshare as ak
-    import pandas as pd
-    from datetime import datetime, timedelta
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from pathlib import Path
+warnings.filterwarnings('ignore')
 
-    # ==================== 配置区 ====================
-    CONFIG = {
-        "min_score": 65,
-        "default_workers": 12,
-        "max_possible_workers": 24,
-    }
 
-    # 核心游资席位（示例，可自行扩展/更新）
-    YOUZI_CORE = {
-        "机构专用", "中国银河证券绍兴", "华泰证券深圳益田路", "东方财富拉萨团结路",
-        "中信证券上海溧阳路", "国泰君安南京太平南路", "中信证券上海分公司",
-    }
+def has_recent_limit_up(df: pd.DataFrame, days=20, threshold=9.5) -> bool:
+    """近days天内是否有涨停或接近涨停"""
+    recent = df.tail(days)
+    return (recent['涨跌幅'] >= threshold).any()
 
-    YOUZI_ATTENTION = {
-        "国盛证券宁波解放南路", "华鑫证券上海分公司", "财通证券杭州五星路",
-    }
 
-    ALL_YOUZI = YOUZI_CORE | YOUZI_ATTENTION
+def has_continuous_positive(df: pd.DataFrame, min_days=3) -> tuple[bool, int]:
+    """检查是否有连续阳线，最多统计连续几根"""
+    df = df.copy()
+    df['is_positive'] = df['涨跌幅'] > 0
+    df['group'] = (df['is_positive'] != df['is_positive'].shift()).cumsum()
+    consecutive = df[df['is_positive']].groupby('group').size()
+    max_consec = consecutive.max() if not consecutive.empty else 0
+    return max_consec >= min_days, max_consec
 
-    # ==================== 三重连阳判定 ====================
-    def check_three_level_continuous_yang(df: pd.DataFrame) -> tuple[bool, str]:
-        """
-        三重连阳涨幅限制判定
-        规则：
-        - 最近7天全是阳线 → 累计涨幅 ≤ 25%
-        - 最近6天全是阳线 → 累计涨幅 ≤ 20%
-        - 最近5天全是阳线 → 累计涨幅 ≤ 15%
-        """
-        if len(df) < 5:
-            return True, "数据不足5天"
 
-        # 取最近10天数据
-        recent = df.tail(10).copy()
-        if len(recent) < 5:
-            return True, "数据不足"
+def has_gap_up(df: pd.DataFrame, lookback=30) -> bool:
+    """检查近lookback天是否存在向上跳空缺口
+    条件：当天最低价 > 前一天最高价
+    """
+    recent = df.tail(lookback)
+    if len(recent) < 2:
+        return False
+    gap_up = (recent['最低'] > recent['最高'].shift(1))
+    return gap_up.any()
 
-        # 计算每日涨幅倍数 (1 + 涨幅)
-        recent['pct_multiplier'] = recent['涨跌幅'] / 100 + 1
 
-        # 从旧到新排序（方便切片）
-        recent = recent.sort_index(ascending=True)
-        multipliers = recent['pct_multiplier'].values
+def has_volume_explosion(df: pd.DataFrame, lookback=20, vol_ratio_threshold=3.0) -> bool:
+    """
+    成交量放大判断（两种方式任一满足即可）
+    1. 最新一天量比 > vol_ratio_threshold
+    2. 最近3天平均成交量 > 前10天平均成交量的 vol_ratio_threshold 倍
+    """
+    if len(df) < lookback + 3:
+        return False
 
-        for length, limit in [(7, 0.25), (6, 0.20), (5, 0.15)]:
-            if len(multipliers) >= length:
-                segment = multipliers[-length:]  # 最后length天
-                # 检查是否连续阳线（严格大于1.0）
-                if all(x > 1.0 for x in segment):
-                    cum_return = segment.prod() - 1
-                    if cum_return > limit:
-                        return False, f"{length}连阳累计涨幅 {cum_return:.2%} > {limit:.0%}限制"
+    latest_vol = df['成交量'].iloc[-1]
+    recent_3 = df['成交量'].tail(3).mean()
+    earlier_10 = df['成交量'].iloc[-13:-3].mean()  # 前10天（不含最近3天）
 
-        return True, "三重连阳判定通过"
+    # 方式1：当天量比（粗略用成交量/前一天）
+    if len(df) >= 2:
+        prev_vol = df['成交量'].iloc[-2]
+        if prev_vol > 0 and latest_vol / prev_vol >= vol_ratio_threshold:
+            return True
 
-    # ==================== 辅助函数 ====================
-    def get_youzi_level(buyers):
-        core = sum(1 for x in buyers if x in YOUZI_CORE)
-        att = sum(1 for x in buyers if x in YOUZI_ATTENTION)
-        if core >= 2: return "核心×2+"
-        if core >= 1: return "核心"
-        if att >= 2: return "关注×2+"
-        if att >= 1: return "关注"
-        return "普通"
+    # 方式2：最近3天 vs 前10天
+    if earlier_10 > 0 and recent_3 / earlier_10 >= vol_ratio_threshold:
+        return True
 
-    def is_youzi_pattern(df, youzi_level):
-        score = 0
-        reasons = []
+    return False
 
-        # 席位权重
-        if youzi_level == "核心×2+": score += 35; reasons.append("核心×2+")
-        elif youzi_level == "核心":   score += 25; reasons.append("核心席位")
-        elif "关注" in youzi_level:   score += 15; reasons.append("关注席位")
 
-        latest = df.iloc[-1]
-        # 涨幅
-        if latest["涨跌幅"] >= 9.5:   score += 20; reasons.append("涨停")
-        elif latest["涨跌幅"] >= 7:    score += 12; reasons.append("大涨≥7%")
-        # 换手
-        if latest["换手率"] >= 25:     score += 18; reasons.append("换手≥25%")
-        elif latest["换手率"] >= 15:   score += 10; reasons.append("换手≥15%")
+def scan_big_rise_pattern(code: str, name: str, end_date: str = None):
+    """单只股票扫描4信号是否同时满足"""
+    if end_date is None:
+        end_date = datetime.now().strftime("%Y%m%d")
 
-        return score, "；".join(reasons)
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=(datetime.now() - timedelta(days=180)).strftime("%Y%m%d"),
+            end_date=end_date,
+            adjust="qfq"
+        )
 
-    # ==================== 数据获取（带缓存） ====================
-    @st.cache_data(ttl=1800, show_spinner=False)
-    def fetch_kline(code, end_date):
-        try:
-            return ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=(datetime.now() - timedelta(days=150)).strftime("%Y%m%d"),
-                end_date=end_date,
-                adjust="qfq"
-            )
-        except:
-            return pd.DataFrame()
+        if df.empty or len(df) < 30:
+            return None
 
-    @st.cache_data(ttl=3600, show_spinner=False)
-    def get_all_industries():
-        try:
-            df = ak.stock_board_industry_name_ths()
-            return sorted(df['industry'].unique().tolist())
-        except:
-            return ["获取行业列表失败"]
+        signals = {}
 
-    # ==================== 单票处理 ====================
-    def process_stock(item, scan_date, selected_industries):
-        code, name = item
-        
-        # 板块过滤
-        if selected_industries:
-            try:
-                info = ak.stock_individual_info_em(code)
-                industry = info[info['item'] == '行业']['value'].values[0]
-                if industry not in selected_industries:
-                    return None
-            except:
-                return None
+        # 1. 近期涨停
+        signals['涨停'] = has_recent_limit_up(df, days=20)
 
-        try:
-            df = fetch_kline(code, scan_date)
-            if df.empty or len(df) < 30:
-                return None
+        # 2. 连续阳线（至少3根，记录最长连续）
+        has_consec, consec_count = has_continuous_positive(df, min_days=3)
+        signals['连续阳线'] = has_consec
+        signals['连续阳线根数'] = consec_count
 
-            # 三重连阳强过滤（放在前面，避免浪费资源）
-            pass_yang, yang_msg = check_three_level_continuous_yang(df)
-            if not pass_yang:
-                return None   # 可改为记录日志或返回调试信息
+        # 3. 向上跳空缺口
+        signals['向上缺口'] = has_gap_up(df, lookback=30)
 
-            lhb = ak.stock_lhb_detail_em(scan_date, scan_date)
-            lhb_this = lhb[lhb['代码'] == code]
-            if lhb_this.empty:
-                return None
+        # 4. 成交量放大
+        signals['放巨量'] = has_volume_explosion(df, vol_ratio_threshold=3.0)
 
-            buyers = lhb_this['买入营业部名称'].str.strip().tolist()
-            level = get_youzi_level(buyers)
-            if level == "普通":
-                return None
+        # 判断是否4信号齐全
+        all_true = all(signals.values())
 
-            score, reason = is_youzi_pattern(df, level)
-            if score >= CONFIG["min_score"]:
-                latest = df.iloc[-1]
-                return {
-                    "代码": code,
-                    "名称": name,
-                    "得分": score,
-                    "理由": reason,
-                    "涨幅": f"{latest['涨跌幅']:.2f}%",
-                    "换手": f"{latest['换手率']:.2f}%",
-                    "席位": level,
-                    "收盘价": f"{latest['收盘']:.2f}"
-                }
-        except:
-            pass
+        if all_true:
+            latest = df.iloc[-1]
+            return {
+                "代码": code,
+                "名称": name,
+                "最新收盘": round(latest['收盘'], 2),
+                "最新涨幅": f"{latest['涨跌幅']:.2f}%",
+                "最新换手": f"{latest['换手率']:.2f}%",
+                "连续阳线": f"{consec_count}根",
+                "信号日期": latest['日期'],
+                "完整信号": "✓✓✓✓ 4信号齐全"
+            }
+
         return None
 
-    # ==================== Streamlit 主界面 ====================
-    def main():
-        st.set_page_config(page_title="游资扫描器", layout="wide")
-        st.title("游资突击扫描器（含三重连阳过滤）")
-        st.caption("数据来源于 akshare，仅供学习交流，不构成投资建议")
+    except Exception as e:
+        # print(f"{code} 处理异常: {e}")
+        return None
 
-        # ------------------- 侧边栏 -------------------
-        with st.sidebar:
-            st.header("扫描参数")
 
-            scan_date = st.date_input(
-                "选择日期",
-                value=datetime.now().date(),
-                max_value=datetime.now().date()
-            ).strftime("%Y%m%d")
+def main():
+    # 示例：扫描当天龙虎榜个股（可改成自选股列表或全市场）
+    print("正在获取今日龙虎榜...")
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        lhb = ak.stock_lhb_detail_em(today, today)
+        if lhb.empty:
+            print("今日暂无龙虎榜数据")
+            return
 
-            num_workers = st.slider(
-                "并发线程数",
-                min_value=4,
-                max_value=CONFIG["max_possible_workers"],
-                value=CONFIG["default_workers"],
-                step=2,
-                help="建议12~18，过高容易被接口限流"
-            )
+        candidates = lhb[['代码', '名称']].drop_duplicates()
 
-            st.subheader("板块过滤（可选）")
-            all_industries = get_all_industries()
-            selected_industries = st.multiselect(
-                "只显示以下行业（留空=不过滤）",
-                options=all_industries,
-                default=[],
-                help="可多选，按住 Ctrl 或 Shift"
-            )
+        print(f"发现 {len(candidates)} 只上榜个股，开始扫描4信号...")
 
-        # ------------------- 主界面 -------------------
-        if st.button("开始扫描", type="primary", use_container_width=True):
-            with st.spinner(f"正在扫描 {scan_date} 的龙虎榜..."):
-                try:
-                    lhb = ak.stock_lhb_detail_em(scan_date, scan_date)
-                    if lhb.empty:
-                        st.warning("当天无龙虎榜数据")
-                        return
+        results = []
+        for _, row in candidates.iterrows():
+            result = scan_big_rise_pattern(row['代码'], row['名称'])
+            if result:
+                results.append(result)
+                print(f"发现4信号齐全！ {row['代码']} {row['名称']}")
 
-                    candidates = lhb[['代码', '名称']].drop_duplicates().values.tolist()
-                    st.info(f"上榜个股数量：{len(candidates)}   |   线程：{num_workers}   |   过滤行业：{len(selected_industries)}个")
+        if results:
+            df_result = pd.DataFrame(results)
+            print("\n" + "="*60)
+            print("今日4大信号齐全个股（大涨前兆概率较高）")
+            print("="*60)
+            print(df_result.to_string(index=False))
+            df_result.to_csv(f"4信号齐全_{today}.csv", index=False, encoding='utf-8-sig')
+            print(f"\n结果已保存至：4信号齐全_{today}.csv")
+        else:
+            print("\n今日暂未发现4信号同时齐全的个股")
 
-                    results = []
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+    except Exception as e:
+        print("主程序异常:", e)
 
-                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                        futures = [
-                            executor.submit(process_stock, item, scan_date, selected_industries)
-                            for item in candidates
-                        ]
-                        total = len(futures)
 
-                        for i, future in enumerate(as_completed(futures)):
-                            result = future.result()
-                            if result:
-                                results.append(result)
-                                st.success(f"发现：{result['代码']} {result['名称']}  {result['得分']}分")
-                            progress = (i + 1) / total
-                            progress_bar.progress(progress)
-                            status_text.text(f"进度：{i+1}/{total}  ({progress:.1%})")
-
-                    if results:
-                        df = pd.DataFrame(results).sort_values("得分", ascending=False)
-                        st.subheader(f"符合条件结果（共 {len(df)} 只）")
-                        st.dataframe(
-                            df[['代码', '名称', '得分', '涨幅', '换手', '席位', '理由']],
-                            use_container_width=True,
-                            hide_index=True
-                        )
-
-                        csv = df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-                        st.download_button(
-                            label="下载完整结果 (CSV)",
-                            data=csv,
-                            file_name=f"游资扫描_{scan_date}.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.info("今天暂未发现符合条件的游资特征个股（或全部被三重连阳过滤）")
-
-                except Exception as e:
-                    st.error("扫描过程中发生错误")
-                    with st.expander("详细错误信息"):
-                        st.code(str(e))
-                        st.code(traceback.format_exc())
-
-    if __name__ == "__main__":
-        main()
-
-except ImportError as e:
-    print("依赖导入失败，请检查是否安装：streamlit, akshare, pandas")
-    print("错误：", e)
-    sys.exit(1)
-except Exception as e:
-    print("程序启动异常：")
-    print(traceback.format_exc())
-    sys.exit(1)
+if __name__ == "__main__":
+    main()
