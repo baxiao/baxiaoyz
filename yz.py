@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-游资突击扫描器 - 2025/2026主流短线思路框架
+游资突击扫描器 - 2025/2026主流短线思路框架（方案2版本）
+避免使用全局变量，日期作为参数传递
+
 功能：
 1. 三重连阳累计涨幅限制
 2. 多线程扫描（默认最大20，可配置）
-3. 进度条 + 简单倒计时提示
+3. 进度条
 4. 可选板块过滤（使用akshare行业分类）
 5. 游资席位 + 量价 + 形态综合打分
 
@@ -24,6 +26,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+
 # ===================== 配置读取 =====================
 try:
     with open("config.yaml", encoding="utf-8") as f:
@@ -31,9 +34,6 @@ try:
 except FileNotFoundError:
     print("未找到 config.yaml，请创建配置文件")
     exit(1)
-
-TODAY_STR = datetime.now().strftime("%Y%m%d")
-YESTERDAY_STR = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 
 MIN_SCORE = CONFIG.get("min_score", 65)
 MAX_WORKERS = CONFIG.get("max_workers", 20)
@@ -98,10 +98,10 @@ def check_continuous_yang_limit(df: pd.DataFrame) -> tuple[bool, str]:
                 if cum_return > limit:
                     return False, f"{days}连阳涨幅{cum_return:.2%} > {limit:.0%}"
 
-    return True, "连阳合格"
+    return True, "连阳限制通过"
 
 
-# ===================== 主形态判断（此处只是示例框架） =====================
+# ===================== 主形态判断（示例框架，需自行完善） =====================
 def is_youzi_pattern(df: pd.DataFrame, lhb_row, youzi_level: str) -> tuple[int, str]:
     score = 0
     reasons = []
@@ -143,7 +143,7 @@ def is_youzi_pattern(df: pd.DataFrame, lhb_row, youzi_level: str) -> tuple[int, 
 
     # 4. 流通市值（越小越好）
     try:
-        info = ak.stock_individual_info_em(latest.name)
+        info = ak.stock_individual_info_em(df['代码'].iloc[0])
         circ_mv = float(info[info['item'] == '流通市值']['value'].iloc[0]) / 1e8  # 亿元
         if circ_mv < 50:
             score += 12
@@ -158,16 +158,16 @@ def is_youzi_pattern(df: pd.DataFrame, lhb_row, youzi_level: str) -> tuple[int, 
 
 
 # ===================== 单票处理函数 =====================
-def process_one_stock(code_name_tuple) -> dict | None:
+def process_one_stock(code_name_tuple, scan_date: str) -> dict | None:
     code, name = code_name_tuple
 
     try:
-        # 获取日K（建议做缓存，此处简化）
+        # 获取日K
         df = ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
             start_date=(datetime.now() - timedelta(days=150)).strftime("%Y%m%d"),
-            end_date=TODAY_STR,
+            end_date=scan_date,
             adjust="qfq"
         )
 
@@ -176,7 +176,7 @@ def process_one_stock(code_name_tuple) -> dict | None:
 
         # 获取当天龙虎榜席位（简化版，实际建议缓存全天龙虎榜）
         try:
-            lhb = ak.stock_lhb_detail_em(TODAY_STR, TODAY_STR)
+            lhb = ak.stock_lhb_detail_em(scan_date, scan_date)
             lhb_this = lhb[lhb['代码'] == code]
             if lhb_this.empty:
                 return None
@@ -213,17 +213,18 @@ def process_one_stock(code_name_tuple) -> dict | None:
 # ===================== 主程序 =====================
 def main():
     parser = argparse.ArgumentParser(description="游资突击扫描器")
-    parser.add_argument("--date", type=str, default=TODAY_STR, help="指定扫描日期 YYYYMMDD")
+    parser.add_argument("--date", type=str, 
+                        default=datetime.now().strftime("%Y%m%d"),
+                        help="指定扫描日期 YYYYMMDD，默认当天")
     args = parser.parse_args()
 
-    global TODAY_STR
-    TODAY_STR = args.date
+    scan_date = args.date
 
-    print(f"\n=== 游资突击扫描 {TODAY_STR} 开始 ===\n")
+    print(f"\n=== 游资突击扫描 {scan_date} 开始 ===\n")
 
     # 1. 获取当天龙虎榜
     try:
-        lhb = ak.stock_lhb_detail_em(TODAY_STR, TODAY_STR)
+        lhb = ak.stock_lhb_detail_em(scan_date, scan_date)
         print(f"当日龙虎榜记录数：{len(lhb)}")
     except Exception as e:
         print("获取龙虎榜失败", e)
@@ -233,7 +234,7 @@ def main():
     candidates = lhb[['代码', '名称']].drop_duplicates().values.tolist()
     print(f"上榜个股数量：{len(candidates)}")
 
-    # 3. 可选：板块过滤（使用行业分类做简单版）
+    # 3. 可选：板块过滤
     if USE_SECTOR_FILTER and (INCLUDE_SECTORS or EXCLUDE_SECTORS):
         print("执行板块过滤...")
         filtered = []
@@ -255,7 +256,7 @@ def main():
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_code = {
-            executor.submit(process_one_stock, item): item
+            executor.submit(process_one_stock, item, scan_date): item
             for item in candidates
         }
 
@@ -273,13 +274,13 @@ def main():
     df_result = pd.DataFrame(results).sort_values("得分", ascending=False)
 
     print("\n" + "="*60)
-    print("           今日游资突击嫌疑股排行")
+    print("           扫描日期:", scan_date, "   游资突击嫌疑股排行")
     print("="*60)
     print(df_result.to_string(index=False))
     print("="*60 + "\n")
 
-    # 可选保存
-    save_path = Path(f"result_{TODAY_STR}.csv")
+    # 保存结果
+    save_path = Path(f"result_{scan_date}.csv")
     df_result.to_csv(save_path, index=False, encoding="utf-8-sig")
     print(f"结果已保存至：{save_path}")
 
