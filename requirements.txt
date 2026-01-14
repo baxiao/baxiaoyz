@@ -1,5 +1,5 @@
-streamlit>=1.38.0
-akshare>=1.15.0
+streamlit>=1.30.0
 pandas>=2.0.0
-tqdm>=4.66.0
-pyyaml>=6.0.0
+akshare>=1.13.0
+plotly>=5.18.0
+openpyxl
