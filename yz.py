@@ -5,147 +5,225 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 from datetime import datetime, timedelta, timezone
+import plotly.express as px
+from functools import lru_cache
 
-# --- 1. 配置与安全 ---
-st.set_page_config(page_title="游资核心标的追踪-全市场活跃版", layout="wide")
+# ── 页面基础配置 ──
+st.set_page_config(
+    page_title="游资核心标的追踪 - 全市场活跃版",
+    layout="wide",
+    page_icon="🚀",
+    initial_sidebar_state="expanded"
+)
 
+# ── 密码验证 ──
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
+    
     if not st.session_state["password_correct"]:
-        pwd = st.text_input("请输入访问令牌", type="password")
-        if st.button("验证登录"):
+        st.markdown("### 🔐 访问控制")
+        pwd = st.text_input("请输入访问令牌", type="password", key="pwd_input")
+        if st.button("验证", use_container_width=True, type="primary"):
             target_pwd = st.secrets.get("ACCESS_PASSWORD", "888888")
             if pwd == target_pwd:
                 st.session_state["password_correct"] = True
                 st.rerun()
             else:
-                st.error("令牌错误")
-        return False
+                st.error("令牌错误，请重试")
+        st.stop()
     return True
 
-# --- 2. 核心判定逻辑 ---
+# ── 北京时间工具 ──
+@st.cache_data(ttl=60)
 def get_beijing_time():
-    """获取北京时间"""
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-def process_single_stock(code, name, current_price, turnover_rate, sector_info):
+# ── 缓存板块列表 ──
+@st.cache_data(ttl=3600)  # 缓存1小时
+def get_all_sectors():
+    return ak.stock_board_industry_name_em()['板块名称'].tolist()
+
+# ── 单只股票处理逻辑（核心判定） ──
+@lru_cache(maxsize=500)
+def fetch_stock_hist(code):
     try:
-        # 获取判定所需的天数（8天用于判定是否超过7连阳）
-        hist = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(8)
-        if hist is None or len(hist) < 5: return None
-        
-        # --- 封顶剔除逻辑：超过7连阳的剔除 ---
-        if len(hist) == 8:
-            is_8_positive = (hist['收盘'] > hist['开盘']).all()
-            if is_8_positive:
-                return None
-        
-        hist_7 = hist.tail(7)
-        
-        def check_logic(data, days, max_gain):
-            sub_data = data.tail(days)
-            if len(sub_data) < days: return False, 0
-            is_positive = (sub_data['收盘'] > sub_data['开盘']).all()
-            total_gain = (sub_data.iloc[-1]['收盘'] - sub_data.iloc[0]['开盘']) / sub_data.iloc[0]['开盘'] * 100
-            return is_positive and total_gain <= max_gain, round(total_gain, 2)
-        
-        # --- 三重判定逻辑 ---
-        match7, gain7 = check_logic(hist_7, 7, 22.5)
-        if match7:
-            res_type, res_gain = "🔥 7连阳/≤22.5%", gain7
-        else:
-            match6, gain6 = check_logic(hist_7, 6, 17.5)
-            if match6:
-                res_type, res_gain = "⭐ 6连阳/≤17.5%", gain6
-            else:
-                match5, gain5 = check_logic(hist_7, 5, 12.5)
-                if match5:
-                    res_type, res_gain = "⚡ 5连阳/≤12.5%", gain5
-                else:
-                    return None
-        
-        return {
-            "代码": code,
-            "名称": name,
-            "当前价格": current_price,
-            "今日换手率": f"{turnover_rate}%",
-            "判定强度": res_type,
-            "累计涨幅": f"{res_gain}%",
-            "所属板块": sector_info,
-            "查询时间(北京)": get_beijing_time()
-        }
+        return ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").tail(8)
     except:
+        return pd.DataFrame()
+
+def process_single_stock(code, name, current_price, turnover_rate, sector_info):
+    hist = fetch_stock_hist(code)
+    if hist.empty or len(hist) < 5:
         return None
 
-# --- 3. 页面渲染 ---
+    # 超过7连阳直接剔除
+    if len(hist) == 8 and (hist['收盘'] > hist['开盘']).all():
+        return None
+
+    hist_7 = hist.tail(7)
+
+    def check_consecutive_positive(data, days, max_gain_pct):
+        if len(data) < days:
+            return False, 0.0
+        sub = data.tail(days)
+        is_all_up = (sub['收盘'] > sub['开盘']).all()
+        if not is_all_up:
+            return False, 0.0
+        gain = (sub.iloc[-1]['收盘'] - sub.iloc[0]['开盘']) / sub.iloc[0]['开盘'] * 100
+        return gain <= max_gain_pct, round(gain, 2)
+
+    # 三级强度判定
+    for days, max_gain, label, emoji in [
+        (7, 22.5, "7连阳", "🔥"),
+        (6, 17.5, "6连阳", "⭐"),
+        (5, 12.5, "5连阳", "⚡")
+    ]:
+        match, gain = check_consecutive_positive(hist_7, days, max_gain)
+        if match:
+            return {
+                "代码": code,
+                "名称": name,
+                "现价": round(current_price, 2),
+                "换手率": f"{turnover_rate:.2f}%",
+                "强度": f"{emoji} {label} ≤{max_gain}%",
+                "涨幅": f"{gain}%",
+                "板块": sector_info,
+                "扫描时间": get_beijing_time()
+            }
+    return None
+
+# ── 主程序 ──
 if check_password():
-    st.title("🚀 游资核心追踪 (全市场活跃主板版)")
-    with st.spinner("同步实时数据..."):
-        all_sectors = ak.stock_board_industry_name_em()['板块名称'].tolist()
-    selected_sector = st.sidebar.selectbox("选择查询范围", ["全市场扫描"] + all_sectors)
-    thread_count = st.sidebar.slider("并发线程数", 1, 30, 20)
-    
-    if st.button("开启全速扫描"):
-        countdown = st.empty()
-        for i in range(3, 0, -1):
-            countdown.metric("极速引擎正在预热...", f"{i} 秒")
-            time.sleep(1)
-        countdown.empty()
-        with st.spinner("正在筛选活跃主板标的池..."):
-            if selected_sector == "全市场扫描":
+    # 标题 + 说明
+    st.title("🚀 游资核心标的实时追踪")
+    st.caption("全市场主板 · 换手率≥5% · 5-7连阳控涨幅 | 数据来源于akshare")
+
+    # 侧边栏控制
+    with st.sidebar:
+        st.header("扫描控制")
+        selected_scope = st.selectbox("查询范围", ["全市场扫描"] + get_all_sectors(), index=0)
+        max_threads = st.slider("并发线程数", 5, 40, 20, step=5)
+        min_turnover = st.slider("最低换手率(%)", 3.0, 15.0, 5.0, step=0.5)
+        st.markdown("---")
+        st.info("建议线程数根据你的网络和服务器性能调整，过高可能触发接口限流")
+
+    # ── 扫描按钮 ──
+    if st.button("🔥 开始全速扫描", type="primary", use_container_width=True):
+        with st.spinner("正在获取活跃标的池..."):
+            if selected_scope == "全市场扫描":
                 df_pool = ak.stock_zh_a_spot_em()
             else:
-                df_pool = ak.stock_board_industry_cons_em(symbol=selected_sector)
-            # --- 核心筛选与剔除 ---
-            # 1. 剔除 ST/退市/非主板
-            df_pool = df_pool[~df_pool['名称'].str.contains("ST|退市")]
-            df_pool = df_pool[~df_pool['代码'].str.startswith(("30", "688", "9"))]
-            
-            # 2. 新增：换手率大于或等于 5% (AkShare字段名为'换手率')
-            df_pool = df_pool[df_pool['换手率'] >= 5.0]
-        stocks_to_check = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
-        total_stocks = len(stocks_to_check)
-        
-        st.write(f"📊 主板活跃标的(换手率≥5%)：{total_stocks} 只")
-        
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
+                df_pool = ak.stock_board_industry_cons_em(symbol=selected_scope)
+
+            # 核心过滤
+            df_pool = df_pool[
+                (~df_pool['名称'].str.contains("ST|退市", na=False)) &
+                (~df_pool['代码'].str.startswith(("30", "688", "9"))) &
+                (df_pool['换手率'] >= min_turnover)
+            ].copy()
+
+        stocks = df_pool[['代码', '名称', '最新价', '换手率']].values.tolist()
+        total = len(stocks)
+
+        if total == 0:
+            st.error("当前筛选条件下无符合标的")
+            st.stop()
+
+        st.success(f"找到 {total:,} 只 换手率≥{min_turnover}% 的主板标的，开始判定连阳...")
+
+        # 进度容器
+        progress_bar = st.progress(0)
+        status = st.empty()
+        stats_container = st.empty()
         results = []
-        start_time = time.time()
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            # 传入参数增加换手率 s[3]
-            future_to_stock = {executor.submit(process_single_stock, s[0], s[1], s[2], s[3], selected_sector): s for s in stocks_to_check}
-            
-            for i, future in enumerate(as_completed(future_to_stock)):
+        captured_count = 0
+        start = time.time()
+
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            futures = {
+                executor.submit(process_single_stock, s[0], s[1], s[2], s[3], selected_scope): s
+                for s in stocks
+            }
+
+            for i, future in enumerate(as_completed(futures)):
                 res = future.result()
                 if res:
                     results.append(res)
-                    st.toast(f"✅ 捕获高活跃股: {res['名称']}")
+                    captured_count += 1
+                    st.toast(f"捕获：{res['名称']} {res['强度']}", icon="✅")
+
+                # 更新进度
+                pct = (i + 1) / total
+                progress_bar.progress(pct)
                 
-                curr_p = float(min((i + 1) / total_stocks, 1.0))
-                progress_bar.progress(curr_p)
-                if (i + 1) % 20 == 0:
-                    status_text.text(f"🚀 扫描中... 进度: {i+1}/{total_stocks}")
-        duration = round(time.time() - start_time, 2)
-        status_text.success(f"✨ 扫描完成！耗时 {duration} 秒")
+                # 每10条更新一次状态
+                if (i + 1) % 10 == 0 or i == total - 1:
+                    elapsed = time.time() - start
+                    speed = (i + 1) / elapsed if elapsed > 0 else 0
+                    status.markdown(
+                        f"**扫描进度**：{i+1:,}/{total:,} | "
+                        f"已捕获 **{captured_count}** 只 | "
+                        f"速度 ≈ {speed:.1f} 条/秒 | "
+                        f"耗时 {elapsed:.1f} 秒"
+                    )
+                    
+                    # 实时统计面板
+                    if results:
+                        temp_df = pd.DataFrame(results)
+                        stats_container.metric("当前捕获数量", captured_count)
+
+        # ── 结果展示 ──
+        duration = time.time() - start
+        status.success(f"扫描完成！耗时 {duration:.1f} 秒，共捕获 {captured_count} 只核心标的")
+
         if results:
-            res_df = pd.DataFrame(results)
-            # 重新排列列顺序，换手率放在价格后
-            cols = ["代码", "名称", "当前价格", "今日换手率", "判定强度", "累计涨幅", "所属板块", "查询时间(北京)"]
-            res_df = res_df[cols]
+            df_result = pd.DataFrame(results)
             
-            st.dataframe(res_df, use_container_width=True)
-            output = io.BytesIO()
-            res_df.to_excel(output, index=False)
-            st.download_button(
-                label="📥 导出活跃结果 (Excel)",
-                data=output.getvalue(),
-                file_name=f"活跃精选_{get_beijing_time()[:10]}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            # 排序：强度优先（7>6>5） → 涨幅降序
+            df_result['强度排序'] = df_result['强度'].map({
+                "🔥 7连阳 ≤22.5%": 3,
+                "⭐ 6连阳 ≤17.5%": 2,
+                "⚡ 5连阳 ≤12.5%": 1
+            }).fillna(0)
+            df_result = df_result.sort_values(['强度排序', '涨幅'], ascending=[False, False]).drop(columns='强度排序')
+
+            # 美化展示
+            st.subheader(f"捕获结果（{len(df_result)} 只）")
+
+            # 使用aggrid或st.dataframe + 样式
+            st.dataframe(
+                df_result.style.format({
+                    '现价': '{:.2f}',
+                    '涨幅': lambda x: f'<span style="color:{ "red" if float(x.rstrip("%")) > 0 else "green"}">{x}</span>'
+                }, escape=False),
+                use_container_width=True,
+                column_config={
+                    "代码": st.column_config.TextColumn("代码", width="small"),
+                    "名称": st.column_config.TextColumn("名称", width="medium"),
+                    "现价": st.column_config.NumberColumn("现价", format="%.2f"),
+                    "换手率": st.column_config.TextColumn("换手率"),
+                    "强度": st.column_config.TextColumn("强度", width="medium"),
+                    "涨幅": st.column_config.TextColumn("涨幅"),
+                    "板块": st.column_config.TextColumn("板块", width="medium"),
+                }
             )
+
+            # 导出
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_result.to_excel(writer, index=False, sheet_name="核心标的")
+            st.download_button(
+                "📥 下载 Excel 结果",
+                output.getvalue(),
+                file_name=f"游资核心_{get_beijing_time()[:10]}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
         else:
-            st.warning("暂无符合条件的活跃标的。")
+            st.warning("本次扫描未发现符合5-7连阳控涨幅的标的")
+
     st.divider()
-    st.caption("Master Copy | 全市场活跃主板 | 换手率≥5% | 5-7连阳控幅")
+    st.caption("优化版 | 2025 Powered by Streamlit + akshare | 仅供学习交流")
