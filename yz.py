@@ -1,246 +1,152 @@
-# stock_scanner_multi_thread.py
-# 适合A股的简易多条件扫股框架（2025-2026版参考写法）
-# 依赖: akshare, pandas, tqdm, numpy
-# 建议 python 3.9 ~ 3.11
-# pip install akshare pandas tqdm numpy
-
 import akshare as ak
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-import threading
-import queue
-import time
 from datetime import datetime, timedelta
-import warnings
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-warnings.filterwarnings("ignore")
+# ====================== 核心参数 ======================
+# 连续阳线最少要求几天
+CONSECUTIVE_YANG = 3
+# 成交量放大倍数（当天量 / 前N日均量）
+VOL_MULTIPLIER = 2.0
+VOL_PERIOD = 5
+# 允许涨停误差（有些软件有价格限制导致不是严格10%）
+ZT_THRESHOLD = 0.099
+# 筛选最近多少天内出现过涨停
+RECENT_DAYS = 10
 
-# ================== 可调参数区 ==================
-MAX_WORKERS = 12              # 线程数建议 8~16，根据你的电脑性能
-RECENT_DAYS = 120             # 取多少天历史数据（一般够用）
-MIN_PRICE = 3.0               # 最低价过滤（太便宜容易假突破）
-MAX_PRICE = 120.0             # 最高价过滤（太贵散户难参与）
-VOLUME_RATIO_THRESHOLD = 2.5  # 放量倍数阈值（建议2.0~4.0）
-CONSECUTIVE_YANG = 4          # 连续阳线最少要求
-GAP_THRESHOLD = 0.015         # 跳空缺口最小幅度 1.5%
-NEAR_LIMIT_UP_PCT = 8.5       # 接近涨停判定（小于多少算接近） 创业板/科创板要调高
-
-# 结果保存路径
-RESULT_FILE = f"scan_result_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-# ===============================================
-
-result_queue = queue.Queue()
-lock = threading.Lock()
-
-
-def is_yang_line(row):
-    """判断是否阳线（收盘>开盘） 考虑很小实体也可接受"""
-    return row["close"] > row["open"] and (row["close"] - row["open"]) / row["open"] > 0.002
-
-
-def is_big_yang(row, prev_close):
-    """是否大阳线（相对前收盘）"""
-    change = (row["close"] - prev_close) / prev_close
-    return change >= 0.06  # ≥6% 可调
-
-
-def is_near_limit_up(df):
-    """接近涨停 or 涨停"""
-    last = df.iloc[-1]
-    change = (last["close"] - last["pre_close"]) / last["pre_close"] * 100
-    
-    # 普通股10%，科创/创业20%，这里粗略处理
-    if change >= 9.8:
-        return True, "涨停"
-    elif change >= NEAR_LIMIT_UP_PCT:
-        return True, f"接近涨停({change:.2f}%)"
-    return False, ""
-
+def is_up_limit(prev_close, today_close):
+    """判断是否涨停（主板10%）"""
+    if prev_close <= 0:
+        return False
+    pct = (today_close - prev_close) / prev_close
+    return pct >= ZT_THRESHOLD
 
 def has_gap_up(df):
-    """检测最近5天是否有向上跳空缺口"""
-    for i in range(1, min(6, len(df))):
-        today = df.iloc[-i]
-        yesterday = df.iloc[-i-1]
-        if today["open"] > yesterday["high"] * (1 + GAP_THRESHOLD):
+    """检查最近是否有向上跳空缺口"""
+    for i in range(1, len(df)):
+        if df['low'].iloc[i] > df['high'].iloc[i-1]:
             return True
     return False
 
-
-def has_continuous_yang(df, n=CONSECUTIVE_YANG):
-    """最近n天是否连续阳线"""
-    if len(df) < n:
-        return False
-    recent = df.iloc[-n:]
-    return all(is_yang_line(row) for _, row in recent.iterrows())
-
-
-def has_volume_surge(df, ratio_th=VOLUME_RATIO_THRESHOLD):
-    """最近3天是否有明显放量（相对20日均量）"""
-    if len(df) < 30:
-        return False
-        
-    vol_ma20 = df["volume"].rolling(20).mean()
-    recent_vol = df["volume"].iloc[-3:]
-    recent_ma = vol_ma20.iloc[-3:]
+def get_main_board_stocks():
+    """获取沪深主板股票列表（剔除创业板、科创板、北交所、ST）"""
+    stock_list = ak.stock_zh_a_spot_em()
     
-    # 至少有一天放量达到阈值
-    return (recent_vol / recent_ma >= ratio_th).any()
+    # 剔除ST/*ST/退市
+    stock_list = stock_list[~stock_list['名称'].str.contains("ST|退市", na=False)]
+    
+    # 代码前缀过滤（保留主板 + 中小板）
+    # 主板：60/000/001
+    # 中小板已并入深主板：002/003
+    condition = (
+        (stock_list['代码'].str.startswith(('60', '000', '001', '002', '003'))) &
+        (~stock_list['代码'].str.startswith(('30', '688', '8', '43')))  # 排除创业、科创、北交
+    )
+    
+    df_main = stock_list[condition].copy()
+    df_main['代码'] = df_main['代码'].astype(str).str.zfill(6)  # 补0成6位
+    return df_main['代码'].tolist()
 
-
-def scan_one_stock(code, name, pbar):
+def screen_stock(code):
+    """对单只股票进行四个特征判断"""
     try:
-        # 尝试获取日线数据
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=(datetime.now() - timedelta(days=RECENT_DAYS*1.5)).strftime("%Y%m%d"),
-            end_date=datetime.now().strftime("%Y%m%d"),
-            adjust="qfq"
-        )
+        # 获取最近15~20天日K线（够用）
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", 
+                                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y%m%d"),  # 往前30天确保数据
+                                end_date=datetime.now().strftime("%Y%m%d"),
+                                adjust="qfq")
         
-        if df.empty or len(df) < 30:
-            return
+        if len(df) < 10:
+            return False, None
         
-        df = df.rename(columns={
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "昨收": "pre_close"   # 新版本akshare可能会变，注意适配
-        })
+        df = df.tail(15).reset_index(drop=True)  # 取最近部分
+        df['close'] = pd.to_numeric(df['收盘'], errors='coerce')
+        df['open'] = pd.to_numeric(df['开盘'], errors='coerce')
+        df['high'] = pd.to_numeric(df['最高'], errors='coerce')
+        df['low'] = pd.to_numeric(df['最低'], errors='coerce')
+        df['volume'] = pd.to_numeric(df['成交量'], errors='coerce')
         
-        if "pre_close" not in df.columns:
-            df["pre_close"] = df["close"].shift(1)
-            df = df.dropna(subset=["pre_close"])
+        df = df.dropna(subset=['close','open','high','low','volume'])
+        if len(df) < VOL_PERIOD + 2:
+            return False, None
         
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date")
+        # ① 最近10天内出现过涨停
+        has_zt = False
+        zt_date = None
+        for i in range(1, min(RECENT_DAYS+1, len(df))):
+            if is_up_limit(df['close'].iloc[i-1], df['close'].iloc[i]):
+                has_zt = True
+                zt_date = df['日期'].iloc[i]
+                break
         
-        last_close = df["close"].iloc[-1]
-        if not (MIN_PRICE <= last_close <= MAX_PRICE):
-            return
-            
-        signals = []
+        if not has_zt:
+            return False, None
         
-        # ① 涨停 / 大阳突破
-        is_limit, msg = is_near_limit_up(df)
-        if is_limit:
-            signals.append(f"★{msg}")
+        # ② 最近连续阳线（最后N天）
+        yang_count = 0
+        for i in range(1, CONSECUTIVE_YANG + 1):
+            if i >= len(df):
+                break
+            if df['close'].iloc[-i] > df['open'].iloc[-i]:
+                yang_count += 1
+            else:
+                break
+        if yang_count < CONSECUTIVE_YANG:
+            return False, None
         
-        # 大阳突破关键位置（这里简单用突破前20日最高）
-        if len(df) >= 20:
-            prev_high20 = df["high"].iloc[-21:-1].max()
-            if df["close"].iloc[-1] > prev_high20 * 1.005 and is_big_yang(df.iloc[-1], df["pre_close"].iloc[-1]):
-                signals.append("大阳突破20日高点")
+        # ③ 最近有向上缺口
+        if not has_gap_up(df.tail(8)):
+            return False, None
         
-        # ② 连续阳线
-        if has_continuous_yang(df):
-            signals.append(f"连续阳×{CONSECUTIVE_YANG}+")
+        # ④ 最近一天成交量放大
+        recent_vol = df['volume'].iloc[-1]
+        prev_vol_mean = df['volume'].iloc[-1-VOL_PERIOD:-1].mean()
+        if recent_vol < prev_vol_mean * VOL_MULTIPLIER:
+            return False, None
         
-        # ③ 向上跳空缺口
-        if has_gap_up(df):
-            signals.append("向上跳空缺口")
-        
-        # ④ 放巨量
-        if has_volume_surge(df):
-            signals.append(f"放量>{VOLUME_RATIO_THRESHOLD:.1f}倍")
-        
-        if signals:
-            signal_str = " | ".join(signals)
-            result_queue.put({
-                "code": code,
-                "name": name,
-                "price": round(last_close, 2),
-                "pct": round((df["close"].iloc[-1]/df["pre_close"].iloc[-1]-1)*100, 2),
-                "signals": signal_str,
-                "date": df["date"].iloc[-1].strftime("%Y-%m-%d")
-            })
-            
+        # 全部满足！
+        return True, {
+            '代码': code,
+            '名称': ak.stock_individual_info_em(symbol=code)['value'].iloc[0] if 'value' in ak.stock_individual_info_em(symbol=code) else "未知",
+            '涨停日期': zt_date,
+            '最近阳线数': yang_count,
+            '最新收盘': round(df['close'].iloc[-1], 2),
+            '最新成交量': int(recent_vol),
+            '前均量': round(prev_vol_mean, 0)
+        }
+    
     except Exception as e:
-        pass
-    finally:
-        with lock:
-            pbar.update(1)
-
-
-def worker(task_queue, pbar):
-    while True:
-        try:
-            code, name = task_queue.get_nowait()
-        except queue.Empty:
-            break
-            
-        scan_one_stock(code, name, pbar)
-        task_queue.task_done()
-
-
-def main():
-    print(f"\n=== A股强势形态扫描启动 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===\n")
-    print(f"参数：连续阳>{CONSECUTIVE_YANG}天 | 放量>{VOLUME_RATIO_THRESHOLD}x | 缺口>{GAP_THRESHOLD*100:.1f}% | 接近涨停>{NEAR_LIMIT_UP_PCT}%\n")
-    
-    # 获取全市场股票列表（可替换为其他来源）
-    try:
-        stock_list = ak.stock_zh_a_spot_em()
-        stock_list = stock_list[stock_list["代码"].str.startswith(("0","6","3"))]  # 深沪主板+创业
-        stock_list = stock_list[["代码", "名称"]]
-        stock_list.columns = ["code", "name"]
-        # 可进一步过滤ST、退市等
-        stock_list = stock_list[~stock_list["name"].str.contains("ST|退市|\*")]
-        
-        print(f"共获取 {len(stock_list)} 只股票进行扫描...\n")
-        
-    except Exception as e:
-        print("获取股票列表失败！", e)
-        return
-    
-    task_queue = queue.Queue()
-    for _, row in stock_list.iterrows():
-        task_queue.put((row["code"], row["name"]))
-    
-    # 进度条
-    pbar = tqdm(total=task_queue.qsize(), desc="扫股进度", ncols=100)
-    
-    threads = []
-    for _ in range(min(MAX_WORKERS, len(stock_list))):
-        t = threading.Thread(target=worker, args=(task_queue, pbar))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-    
-    task_queue.join()
-    
-    # 等待所有线程结束
-    for t in threads:
-        t.join(timeout=1.0)
-    
-    pbar.close()
-    
-    # 收集结果
-    results = []
-    while not result_queue.empty():
-        results.append(result_queue.get())
-    
-    if not results:
-        print("\n很遗憾...本次扫描没有符合条件的股票～\n")
-        return
-        
-    df_result = pd.DataFrame(results)
-    df_result = df_result.sort_values(["pct", "price"], ascending=False)
-    
-    print(f"\n找到 {len(df_result)} 只符合条件的股票！\n")
-    print(df_result[["code","name","price","pct","signals"]].to_string(index=False))
-    
-    # 保存
-    try:
-        df_result.to_excel(RESULT_FILE, index=False)
-        print(f"\n结果已保存至：{RESULT_FILE}\n")
-    except Exception as e:
-        print("保存Excel失败:", e)
-
+        # print(f"{code} 获取失败: {e}")
+        return False, None
 
 if __name__ == "__main__":
-    main()
+    print("正在获取符合条件的主板股票列表...")
+    codes = get_main_board_stocks()
+    print(f"共获取 {len(codes)} 只主板非ST股票")
+
+    result_list = []
+    print("开始多线程扫描（加速版）...")
+
+    # 多线程加速：最大线程数设为10~20，避免AKShare接口限流
+    MAX_THREADS = 15
+    lock = threading.Lock()  # 线程安全锁，用于结果追加
+
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        future_to_code = {executor.submit(screen_stock, code): code for code in codes}
+        for future in tqdm(as_completed(future_to_code), total=len(codes)):
+            match, info = future.result()
+            if match:
+                with lock:
+                    result_list.append(info)
+                    print(f"【命中】 {info['代码']} {info['名称']}")
+
+    if result_list:
+        df_result = pd.DataFrame(result_list)
+        df_result.to_csv("涨停前四信号股票.csv", index=False, encoding="utf_8_sig")
+        print("\n筛选完成！结果已保存到 涨停前四信号股票.csv")
+        print(df_result)
+    else:
+        print("\n今天没有发现同时满足4个特征的股票")
