@@ -151,9 +151,11 @@ if input_method == "手动输入":
             '收盘价': prices
         })
     
-    st.dataframe(st.session_state.data, use_container_width=True, height=300)
-    
-    df_input = st.session_state.data
+    if 'data' in st.session_state:
+        st.dataframe(st.session_state.data, use_container_width=True, height=300)
+        df_input = st.session_state.data
+    else:
+        df_input = None
 
 else:  # CSV上传
     st.subheader("📤 上传CSV文件")
@@ -171,4 +173,80 @@ else:  # CSV上传
 if st.button("🚀 开始分析", type="primary"):
     if df_input is not None and len(df_input) > 0:
         with st.spinner("正在分析策略..."):
-            result_df = analyze_strategy(df_i
+            result_df = analyze_strategy(df_input)
+            
+            st.success("✅ 分析完成！")
+            
+            # 显示结果
+            st.subheader("📊 交易信号详情")
+            
+            # 筛选有信号的行
+            signals_only = result_df[result_df['信号'] != '']
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                buy_count = len(signals_only[signals_only['信号'] == '买入'])
+                st.metric("买入次数", buy_count)
+            with col2:
+                sell_count = len(signals_only[signals_only['信号'] == '卖出'])
+                st.metric("卖出次数", sell_count)
+            with col3:
+                final_position = result_df.iloc[-1]['持仓']
+                st.metric("当前状态", final_position)
+            
+            # 显示信号表格
+            st.dataframe(signals_only, use_container_width=True)
+            
+            # 绘制价格走势图
+            st.subheader("📈 价格走势与交易信号")
+            
+            fig = go.Figure()
+            
+            # 价格曲线
+            fig.add_trace(go.Scatter(
+                x=result_df['日期'],
+                y=result_df['收盘价'],
+                mode='lines',
+                name='收盘价',
+                line=dict(color='blue', width=2)
+            ))
+            
+            # 买入信号
+            buy_signals = result_df[result_df['信号'] == '买入']
+            fig.add_trace(go.Scatter(
+                x=buy_signals['日期'],
+                y=buy_signals['收盘价'],
+                mode='markers',
+                name='买入',
+                marker=dict(color='green', size=12, symbol='triangle-up')
+            ))
+            
+            # 卖出信号
+            sell_signals = result_df[result_df['信号'] == '卖出']
+            fig.add_trace(go.Scatter(
+                x=sell_signals['日期'],
+                y=sell_signals['收盘价'],
+                mode='markers',
+                name='卖出',
+                marker=dict(color='red', size=12, symbol='triangle-down')
+            ))
+            
+            fig.update_layout(
+                title="股票价格与交易信号",
+                xaxis_title="日期",
+                yaxis_title="价格",
+                hovermode='x unified',
+                height=500
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 完整数据表
+            with st.expander("📋 查看完整数据"):
+                st.dataframe(result_df, use_container_width=True)
+    else:
+        st.warning("⚠️ 请先输入或上传数据")
+
+# 页脚
+st.markdown("---")
+st.markdown("💡 **使用说明**: 输入股票数据后，点击'开始分析'按钮查看交易策略的买卖信号。")
