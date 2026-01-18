@@ -22,7 +22,7 @@ st.sidebar.markdown("""
 
 **具体条件：**
 1. 历史出现过连板（连续涨停）
-2. 从连板高点回调满14个交易日
+2. 从连板高点回调12-13个交易日
 3. 回调期间未再次涨停
 
 **适用场景：**
@@ -134,8 +134,8 @@ def detect_lianban_callback(df):
     # 计算回调幅度
     callback_rate = ((current_price - lianban_high_price) / lianban_high_price) * 100
     
-    # 判断是否符合条件：回调满14天，且回调期间未再涨停
-    if callback_days >= 14 and not has_zhangting_in_callback:
+    # 判断是否符合条件：回调12-13天，且回调期间未再涨停
+    if 12 <= callback_days <= 13 and not has_zhangting_in_callback:
         return True, lianban_days, callback_days, lianban_date, lianban_high_price, current_price, callback_rate
     
     return False, lianban_days, callback_days, lianban_date, lianban_high_price, current_price, callback_rate
@@ -257,7 +257,7 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
         
         # 显示结果
         if len(results) > 0:
-            st.success(f"✅ 扫描完成！耗时 {elapsed_time:.1f} 秒，找到 {len(results)} 只连板回调14天的股票（共扫描{total_stocks}只）")
+            st.success(f"✅ 扫描完成！耗时 {elapsed_time:.1f} 秒，找到 {len(results)} 只回调12-13天的连板股票（共扫描{total_stocks}只）")
             
             result_df = pd.DataFrame(results)
             
@@ -325,13 +325,10 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
                     )
                     st.plotly_chart(fig, use_container_width=True)
             
-            # 重点关注：刚好14-15天的股票
-            st.subheader("⭐ 重点关注（回调14-15天）")
-            focus_df = result_df[(result_df['回调天数'] >= 14) & (result_df['回调天数'] <= 15)]
-            if len(focus_df) > 0:
-                st.dataframe(focus_df[['股票代码', '股票名称', '连板天数', '连板日期', '当前价格', '回调幅度', '风险等级']], use_container_width=True)
-            else:
-                st.info("暂无刚好回调14-15天的股票")
+            # 重点关注：回调12-13天的股票
+            st.subheader("⭐ 符合条件的股票（回调12-13天）")
+            st.info(f"共找到 {len(result_df)} 只股票，这些是最佳介入时机！")
+            st.dataframe(result_df[['股票代码', '股票名称', '连板天数', '连板日期', '当前价格', '回调天数', '回调幅度', '风险等级']], use_container_width=True)
             
         else:
             st.warning(f"⚠️ 未找到符合条件的股票（耗时{elapsed_time:.1f}秒），请增加扫描数量或调整数据天数")
@@ -345,15 +342,15 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
 st.markdown("---")
 st.markdown("""
 💡 **使用说明**: 
-- **策略核心**：筛选出现连板后回调满14天的个股
+- **策略核心**：筛选出现连板后回调12-13天的个股
 - **数据天数**：建议100天以上，以捕捉更多连板机会
 - **线程数**：推荐5-10个，线程越多速度越快⚡
-- **重点关注**：刚好回调14-15天的股票，可能是最佳介入时机
+- **最佳时机**：回调12-13天是策略设定的最佳介入时机
 - **风险提示**：连板股波动较大，注意风险控制
 
 **策略逻辑**：
 1. 寻找历史出现过连板（≥2个涨停）的股票
-2. 从连板高点回调满14个交易日
+2. 从连板高点回调12-13个交易日
 3. 回调期间未再次涨停
 4. 适合寻找超跌反弹和二次启动机会
 """)
