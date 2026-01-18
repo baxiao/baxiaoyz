@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import akshare as ak
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 st.set_page_config(page_title="连板回调交易策略", layout="wide")
 
@@ -31,6 +33,9 @@ st.sidebar.markdown("""
 - ❌ 剔除ST股票
 - ❌ 剔除北交所股票
 """)
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 使用多线程并发处理，大幅提升扫描速度！")
 
 def is_valid_stock(stock_code, stock_name):
     """检查股票是否符合条件"""
@@ -300,10 +305,65 @@ def generate_prediction(result_df):
     
     return prediction
 
+def process_single_stock(stock_info, days_input, filter_signal):
+    """处理单个股票（用于多线程）"""
+    code = stock_info['代码']
+    name = stock_info['名称']
+    
+    try:
+        # 获取股票数据
+        df_stock = get_stock_data(code, days_input)
+        
+        if df_stock is not None and len(df_stock) >= 15:
+            # 分析策略
+            result_df = analyze_strategy(df_stock)
+            prediction = generate_prediction(result_df)
+            
+            # 获取最新价格
+            latest_price = result_df.iloc[-1]['收盘价']
+            latest_date = result_df.iloc[-1]['日期']
+            
+            # 根据筛选条件过滤
+            should_add = False
+            
+            if filter_signal == "所有符合策略的股票":
+                should_add = True
+            elif filter_signal == "即将买入（1-2天内）":
+                if prediction['next_signal'] in ['买入', '首次买入', '最后买入'] and prediction['countdown'] <= 2:
+                    should_add = True
+            elif filter_signal == "即将卖出（1-2天内）":
+                if prediction['next_signal'] == '卖出' and prediction['countdown'] <= 2:
+                    should_add = True
+            elif filter_signal == "当前持有":
+                if prediction['position'] == '持有':
+                    should_add = True
+            elif filter_signal == "当前空仓":
+                if prediction['position'] == '空仓':
+                    should_add = True
+            
+            if should_add:
+                return {
+                    '股票代码': code,
+                    '股票名称': name,
+                    '最新价格': f"{latest_price:.2f}",
+                    '当前状态': prediction['position'],
+                    '操作建议': prediction['action'],
+                    '下一信号': prediction['next_signal'],
+                    '倒计时': f"{prediction['countdown']}天" if prediction['countdown'] > 0 else "已完成",
+                    '风险等级': prediction['risk_level'],
+                    '策略说明': prediction['reason'],
+                    '阶段': prediction['stage'],
+                    '更新日期': latest_date
+                }
+    except:
+        pass
+    
+    return None
+
 # 主界面
 st.subheader("🔍 全市场股票筛选")
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     days_input = st.number_input("数据天数", min_value=30, max_value=365, value=100)
@@ -315,13 +375,18 @@ with col2:
     )
 
 with col3:
-    max_stocks = st.number_input("最大扫描数量", min_value=10, max_value=500, value=100, help="扫描股票数量越多，耗时越长")
+    max_stocks = st.number_input("最大扫描数量", min_value=10, max_value=1000, value=200, help="扫描股票数量")
+
+with col4:
+    thread_count = st.number_input("线程数", min_value=1, max_value=20, value=10, help="线程越多速度越快，但消耗资源越多")
 
 # 开始扫描按钮
-if st.button("🚀 开始全市场扫描", type="primary"):
+if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    start_time = time.time()
     
     try:
         # 获取A股列表
@@ -340,84 +405,53 @@ if st.button("🚀 开始全市场扫描", type="primary"):
         valid_stocks = valid_stocks[:max_stocks]
         total_stocks = len(valid_stocks)
         
-        status_text.text(f"找到 {total_stocks} 只有效股票，开始分析...")
+        status_text.text(f"找到 {total_stocks} 只有效股票，使用 {thread_count} 个线程并发分析...")
         
-        # 扫描股票
+        # 使用多线程处理
         results = []
+        completed = 0
+        lock = threading.Lock()
         
-        for i, stock in enumerate(valid_stocks):
-            code = stock['代码']
-            name = stock['名称']
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            # 提交所有任务
+            future_to_stock = {
+                executor.submit(process_single_stock, stock, days_input, filter_signal): stock 
+                for stock in valid_stocks
+            }
             
-            progress_bar.progress((i + 1) / total_stocks)
-            status_text.text(f"正在分析 {i+1}/{total_stocks}: {code} {name}")
-            
-            # 获取股票数据
-            df_stock = get_stock_data(code, days_input)
-            
-            if df_stock is not None and len(df_stock) >= 15:
-                try:
-                    # 分析策略
-                    result_df = analyze_strategy(df_stock)
-                    prediction = generate_prediction(result_df)
-                    
-                    # 获取最新价格
-                    latest_price = result_df.iloc[-1]['收盘价']
-                    latest_date = result_df.iloc[-1]['日期']
-                    
-                    # 根据筛选条件过滤
-                    should_add = False
-                    
-                    if filter_signal == "所有符合策略的股票":
-                        should_add = True
-                    elif filter_signal == "即将买入（1-2天内）":
-                        if prediction['next_signal'] in ['买入', '首次买入', '最后买入'] and prediction['countdown'] <= 2:
-                            should_add = True
-                    elif filter_signal == "即将卖出（1-2天内）":
-                        if prediction['next_signal'] == '卖出' and prediction['countdown'] <= 2:
-                            should_add = True
-                    elif filter_signal == "当前持有":
-                        if prediction['position'] == '持有':
-                            should_add = True
-                    elif filter_signal == "当前空仓":
-                        if prediction['position'] == '空仓':
-                            should_add = True
-                    
-                    if should_add:
-                        results.append({
-                            '股票代码': code,
-                            '股票名称': name,
-                            '最新价格': f"{latest_price:.2f}",
-                            '当前状态': prediction['position'],
-                            '操作建议': prediction['action'],
-                            '下一信号': prediction['next_signal'],
-                            '倒计时': f"{prediction['countdown']}天" if prediction['countdown'] > 0 else "已完成",
-                            '风险等级': prediction['risk_level'],
-                            '策略说明': prediction['reason'],
-                            '阶段': prediction['stage'],
-                            '更新日期': latest_date
-                        })
-                except:
-                    pass
-            
-            # 控制请求频率
-            time.sleep(0.1)
+            # 处理完成的任务
+            for future in as_completed(future_to_stock):
+                completed += 1
+                
+                # 更新进度
+                progress = completed / total_stocks
+                progress_bar.progress(progress)
+                status_text.text(f"进度: {completed}/{total_stocks} ({progress*100:.1f}%) - 使用{thread_count}线程并发处理")
+                
+                # 获取结果
+                result = future.result()
+                if result is not None:
+                    with lock:
+                        results.append(result)
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
         
         progress_bar.empty()
         status_text.empty()
         
         # 显示结果
         if len(results) > 0:
-            st.success(f"✅ 扫描完成！找到 {len(results)} 只符合条件的股票")
+            st.success(f"✅ 扫描完成！耗时 {elapsed_time:.1f} 秒，找到 {len(results)} 只符合条件的股票（扫描了{total_stocks}只）")
             
             result_df = pd.DataFrame(results)
             
             # 统计信息
             st.subheader("📊 筛选结果统计")
             
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
-                st.metric("符合条件股票", len(results))
+                st.metric("符合条件", len(results))
             with col2:
                 hold_count = len(result_df[result_df['当前状态'] == '持有'])
                 st.metric("当前持有", hold_count)
@@ -427,20 +461,11 @@ if st.button("🚀 开始全市场扫描", type="primary"):
             with col4:
                 sell_soon = len(result_df[result_df['下一信号'] == '卖出'])
                 st.metric("即将卖出", sell_soon)
+            with col5:
+                st.metric("扫描耗时", f"{elapsed_time:.1f}秒")
             
             # 显示结果表格
             st.subheader("📋 股票列表")
-            
-            # 按风险等级着色
-            def highlight_risk(row):
-                if row['风险等级'] == '高':
-                    return ['background-color: #ffcccc'] * len(row)
-                elif row['风险等级'] == '中':
-                    return ['background-color: #fff4cc'] * len(row)
-                elif row['风险等级'] == '低':
-                    return ['background-color: #ccffcc'] * len(row)
-                else:
-                    return [''] * len(row)
             
             # 显示表格
             display_df = result_df[['股票代码', '股票名称', '最新价格', '当前状态', '操作建议', '下一信号', '倒计时', '风险等级', '策略说明']]
@@ -456,14 +481,24 @@ if st.button("🚀 开始全市场扫描", type="primary"):
             )
             
             # 详细图表
-            with st.expander("📈 查看风险分布"):
-                risk_counts = result_df['风险等级'].value_counts()
-                fig = go.Figure(data=[go.Pie(labels=risk_counts.index, values=risk_counts.values)])
-                fig.update_layout(title="风险等级分布")
-                st.plotly_chart(fig, use_container_width=True)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                with st.expander("📈 风险等级分布"):
+                    risk_counts = result_df['风险等级'].value_counts()
+                    fig = go.Figure(data=[go.Pie(labels=risk_counts.index, values=risk_counts.values)])
+                    fig.update_layout(title="风险等级分布")
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                with st.expander("📊 操作建议分布"):
+                    action_counts = result_df['操作建议'].value_counts()
+                    fig = go.Figure(data=[go.Bar(x=action_counts.index, y=action_counts.values)])
+                    fig.update_layout(title="操作建议分布", xaxis_title="建议", yaxis_title="数量")
+                    st.plotly_chart(fig, use_container_width=True)
             
         else:
-            st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或增加扫描数量")
+            st.warning(f"⚠️ 未找到符合条件的股票（耗时{elapsed_time:.1f}秒），请调整筛选条件或增加扫描数量")
             
     except Exception as e:
         st.error(f"❌ 扫描失败: {str(e)}")
@@ -475,8 +510,9 @@ st.markdown("---")
 st.markdown("""
 💡 **使用说明**: 
 - 选择数据天数和筛选条件
+- 调整线程数（推荐5-10个，线程越多速度越快）
 - 点击"开始全市场扫描"自动分析所有A股
 - 系统自动剔除ST股票和北交所股票
+- 使用多线程并发处理，大幅提升扫描速度⚡
 - 扫描完成后可下载结果CSV文件
-- ⚠️ 扫描数量越多耗时越长，建议从100只开始测试
 """)
