@@ -8,22 +8,27 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-st.set_page_config(page_title="连板回调交易策略", layout="wide")
+st.set_page_config(page_title="连板回调策略", layout="wide")
 
-st.title("📈 连板回调交易策略 - 全市场扫描")
+st.title("📈 连板回调策略 - 全市场扫描")
 st.markdown("---")
 
 # 侧边栏配置
-st.sidebar.header("策略参数设置")
+st.sidebar.header("策略说明")
 st.sidebar.markdown("""
 **策略规则：**
-1. 14天后首次进场
-2. 3红（阳线）后离场
-3. 2阴（阴线）后再次进场
-4. 3红后离场
-5. 7阴后再次进场
-6. 7阳后离场
-7. 14阴后最后进场
+
+🎯 **核心策略**：筛选出现连板后回调14天的个股
+
+**具体条件：**
+1. 历史出现过连板（连续涨停）
+2. 从连板高点回调满14个交易日
+3. 回调期间未再次涨停
+
+**适用场景：**
+- 寻找超跌反弹机会
+- 连板股回调后的二次启动
+- 短线交易机会
 """)
 
 st.sidebar.markdown("---")
@@ -62,250 +67,80 @@ def get_stock_data(stock_code, days=100):
         
         df = df.rename(columns={
             '日期': '日期',
-            '收盘': '收盘价'
+            '收盘': '收盘价',
+            '开盘': '开盘价',
+            '最高': '最高价',
+            '最低': '最低价',
+            '涨跌幅': '涨跌幅'
         })
         
-        df = df[['日期', '收盘价']].copy()
+        # 确保有涨跌幅列
+        if '涨跌幅' not in df.columns:
+            df['涨跌幅'] = df['收盘价'].pct_change() * 100
         
         return df
     except Exception as e:
         return None
 
-def analyze_strategy(df):
-    """分析交易策略"""
+def detect_lianban_callback(df):
+    """
+    检测连板后回调14天的股票
+    返回：(是否符合, 连板天数, 回调天数, 连板日期, 最高价, 当前价, 回调幅度)
+    """
+    if df is None or len(df) < 20:
+        return False, 0, 0, None, 0, 0, 0
+    
     df = df.copy()
-    df['涨跌'] = df['收盘价'].diff()
-    df['红绿'] = df['涨跌'].apply(lambda x: '红' if x > 0 else ('绿' if x < 0 else '平'))
     
-    signals = []
-    position = None
-    entry_price = 0
-    day_count = 0
-    red_count = 0
-    green_count = 0
-    stage = 0
+    # 判断涨停（涨幅 >= 9.5%，考虑误差）
+    df['是否涨停'] = df['涨跌幅'] >= 9.5
     
-    for idx, row in df.iterrows():
-        signal = None
-        
-        if stage == 0:
-            day_count += 1
-            if day_count >= 14:
-                signal = '买入'
-                position = '持有'
-                entry_price = row['收盘价']
-                stage = 1
-                red_count = 0
-                
-        elif stage == 1 and position == '持有':
-            if row['红绿'] == '红':
-                red_count += 1
-                if red_count >= 3:
-                    signal = '卖出'
-                    position = None
-                    stage = 2
-                    green_count = 0
-            else:
-                red_count = 0
-                
-        elif stage == 2 and position is None:
-            if row['红绿'] == '绿':
-                green_count += 1
-                if green_count >= 2:
-                    signal = '买入'
-                    position = '持有'
-                    entry_price = row['收盘价']
-                    stage = 3
-                    red_count = 0
-            else:
-                green_count = 0
-                
-        elif stage == 3 and position == '持有':
-            if row['红绿'] == '红':
-                red_count += 1
-                if red_count >= 3:
-                    signal = '卖出'
-                    position = None
-                    stage = 4
-                    green_count = 0
-            else:
-                red_count = 0
-                
-        elif stage == 4 and position is None:
-            if row['红绿'] == '绿':
-                green_count += 1
-                if green_count >= 7:
-                    signal = '买入'
-                    position = '持有'
-                    entry_price = row['收盘价']
-                    stage = 5
-                    red_count = 0
-            else:
-                green_count = 0
-                
-        elif stage == 5 and position == '持有':
-            if row['红绿'] == '红':
-                red_count += 1
-                if red_count >= 7:
-                    signal = '卖出'
-                    position = None
-                    stage = 6
-                    green_count = 0
-            else:
-                red_count = 0
-                
-        elif stage == 6 and position is None:
-            if row['红绿'] == '绿':
-                green_count += 1
-                if green_count >= 14:
-                    signal = '买入'
-                    position = '持有'
-                    entry_price = row['收盘价']
-                    stage = 7
-            else:
-                green_count = 0
-        
-        signals.append({
-            '日期': row['日期'],
-            '收盘价': row['收盘价'],
-            '红绿': row['红绿'],
-            '信号': signal if signal else '',
-            '持仓': position if position else '空仓',
-            '阶段': stage,
-            '红线计数': red_count,
-            '绿线计数': green_count
-        })
+    # 寻找连板（至少2个涨停）
+    lianban_found = False
+    lianban_end_idx = -1
+    lianban_days = 0
+    lianban_high_price = 0
+    lianban_date = None
     
-    return pd.DataFrame(signals)
+    consecutive_count = 0
+    
+    for i in range(len(df)):
+        if df.iloc[i]['是否涨停']:
+            consecutive_count += 1
+        else:
+            # 连续涨停结束
+            if consecutive_count >= 2:  # 至少2个涨停才算连板
+                lianban_found = True
+                lianban_days = consecutive_count
+                lianban_end_idx = i - 1
+                lianban_high_price = df.iloc[lianban_end_idx]['收盘价']
+                lianban_date = df.iloc[lianban_end_idx]['日期']
+                break
+            consecutive_count = 0
+    
+    if not lianban_found:
+        return False, 0, 0, None, 0, 0, 0
+    
+    # 计算从连板结束后的回调天数
+    callback_days = len(df) - lianban_end_idx - 1
+    
+    # 检查回调期间是否再次涨停
+    callback_period = df.iloc[lianban_end_idx + 1:]
+    has_zhangting_in_callback = callback_period['是否涨停'].any()
+    
+    # 当前价格
+    current_price = df.iloc[-1]['收盘价']
+    
+    # 计算回调幅度
+    callback_rate = ((current_price - lianban_high_price) / lianban_high_price) * 100
+    
+    # 判断是否符合条件：回调满14天，且回调期间未再涨停
+    if callback_days >= 14 and not has_zhangting_in_callback:
+        return True, lianban_days, callback_days, lianban_date, lianban_high_price, current_price, callback_rate
+    
+    return False, lianban_days, callback_days, lianban_date, lianban_high_price, current_price, callback_rate
 
-def generate_prediction(result_df):
-    """生成预测和建议"""
-    last_row = result_df.iloc[-1]
-    current_stage = last_row['阶段']
-    current_position = last_row['持仓']
-    red_count = last_row['红线计数']
-    green_count = last_row['绿线计数']
-    current_color = last_row['红绿']
-    
-    prediction = {
-        'stage': current_stage,
-        'position': current_position,
-        'action': '',
-        'reason': '',
-        'next_signal': '',
-        'countdown': 0,
-        'risk_level': ''
-    }
-    
-    if current_stage == 0:
-        days_passed = len(result_df)
-        days_left = max(0, 14 - days_passed)
-        prediction['action'] = '等待观察'
-        prediction['reason'] = f'还需等待{days_left}天'
-        prediction['next_signal'] = '首次买入'
-        prediction['countdown'] = days_left
-        prediction['risk_level'] = '低'
-        
-    elif current_stage == 1 and current_position == '持有':
-        needed = 3 - red_count
-        if current_color == '红':
-            prediction['action'] = '继续持有'
-            prediction['reason'] = f'已{red_count}红，再{needed}红卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '中' if red_count >= 2 else '低'
-        else:
-            prediction['action'] = '继续持有'
-            prediction['reason'] = '等待3红卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = 3
-            prediction['risk_level'] = '低'
-            
-    elif current_stage == 2 and current_position == '空仓':
-        needed = 2 - green_count
-        if current_color == '绿':
-            prediction['action'] = '准备买入'
-            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
-            prediction['next_signal'] = '买入'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '低'
-        else:
-            prediction['action'] = '等待回调'
-            prediction['reason'] = '等待2阴买入'
-            prediction['next_signal'] = '买入'
-            prediction['countdown'] = 2
-            prediction['risk_level'] = '低'
-            
-    elif current_stage == 3 and current_position == '持有':
-        needed = 3 - red_count
-        if current_color == '红':
-            prediction['action'] = '继续持有'
-            prediction['reason'] = f'已{red_count}红，再{needed}红卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '中' if red_count >= 2 else '低'
-        else:
-            prediction['action'] = '继续持有'
-            prediction['reason'] = '等待3红卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = 3
-            prediction['risk_level'] = '低'
-            
-    elif current_stage == 4 and current_position == '空仓':
-        needed = 7 - green_count
-        if current_color == '绿':
-            prediction['action'] = '准备买入'
-            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
-            prediction['next_signal'] = '买入'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '低'
-        else:
-            prediction['action'] = '等待回调'
-            prediction['reason'] = '等待7阴买入'
-            prediction['next_signal'] = '买入'
-            prediction['countdown'] = 7
-            prediction['risk_level'] = '低'
-            
-    elif current_stage == 5 and current_position == '持有':
-        needed = 7 - red_count
-        if current_color == '红':
-            prediction['action'] = '继续持有'
-            prediction['reason'] = f'已{red_count}阳，再{needed}阳卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '高' if red_count >= 5 else '中'
-        else:
-            prediction['action'] = '继续持有'
-            prediction['reason'] = '等待7阳卖出'
-            prediction['next_signal'] = '卖出'
-            prediction['countdown'] = 7
-            prediction['risk_level'] = '中'
-            
-    elif current_stage == 6 and current_position == '空仓':
-        needed = 14 - green_count
-        if current_color == '绿':
-            prediction['action'] = '准备买入'
-            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
-            prediction['next_signal'] = '最后买入'
-            prediction['countdown'] = needed
-            prediction['risk_level'] = '低'
-        else:
-            prediction['action'] = '等待回调'
-            prediction['reason'] = '等待14阴买入'
-            prediction['next_signal'] = '最后买入'
-            prediction['countdown'] = 14
-            prediction['risk_level'] = '低'
-            
-    elif current_stage == 7:
-        prediction['action'] = '持有'
-        prediction['reason'] = '策略完成'
-        prediction['next_signal'] = '无'
-        prediction['countdown'] = 0
-        prediction['risk_level'] = '自定义'
-    
-    return prediction
-
-def process_single_stock(stock_info, days_input, filter_signal):
+def process_single_stock(stock_info, days_input):
     """处理单个股票（用于多线程）"""
     code = stock_info['代码']
     name = stock_info['名称']
@@ -314,46 +149,32 @@ def process_single_stock(stock_info, days_input, filter_signal):
         # 获取股票数据
         df_stock = get_stock_data(code, days_input)
         
-        if df_stock is not None and len(df_stock) >= 15:
-            # 分析策略
-            result_df = analyze_strategy(df_stock)
-            prediction = generate_prediction(result_df)
+        if df_stock is not None and len(df_stock) >= 20:
+            # 检测连板回调
+            is_match, lianban_days, callback_days, lianban_date, high_price, current_price, callback_rate = detect_lianban_callback(df_stock)
             
-            # 获取最新价格
-            latest_price = result_df.iloc[-1]['收盘价']
-            latest_date = result_df.iloc[-1]['日期']
-            
-            # 根据筛选条件过滤
-            should_add = False
-            
-            if filter_signal == "所有符合策略的股票":
-                should_add = True
-            elif filter_signal == "即将买入（1-2天内）":
-                if prediction['next_signal'] in ['买入', '首次买入', '最后买入'] and prediction['countdown'] <= 2:
-                    should_add = True
-            elif filter_signal == "即将卖出（1-2天内）":
-                if prediction['next_signal'] == '卖出' and prediction['countdown'] <= 2:
-                    should_add = True
-            elif filter_signal == "当前持有":
-                if prediction['position'] == '持有':
-                    should_add = True
-            elif filter_signal == "当前空仓":
-                if prediction['position'] == '空仓':
-                    should_add = True
-            
-            if should_add:
+            if is_match:
+                latest_date = df_stock.iloc[-1]['日期']
+                
+                # 计算风险等级
+                if callback_rate >= -10:
+                    risk = '低'
+                elif callback_rate >= -20:
+                    risk = '中'
+                else:
+                    risk = '高'
+                
                 return {
                     '股票代码': code,
                     '股票名称': name,
-                    '最新价格': f"{latest_price:.2f}",
-                    '当前状态': prediction['position'],
-                    '操作建议': prediction['action'],
-                    '下一信号': prediction['next_signal'],
-                    '倒计时': f"{prediction['countdown']}天" if prediction['countdown'] > 0 else "已完成",
-                    '风险等级': prediction['risk_level'],
-                    '策略说明': prediction['reason'],
-                    '阶段': prediction['stage'],
-                    '更新日期': latest_date
+                    '连板天数': lianban_days,
+                    '连板日期': str(lianban_date)[:10],
+                    '连板最高价': f"{high_price:.2f}",
+                    '当前价格': f"{current_price:.2f}",
+                    '回调天数': callback_days,
+                    '回调幅度': f"{callback_rate:.2f}%",
+                    '风险等级': risk,
+                    '更新日期': str(latest_date)[:10]
                 }
     except:
         pass
@@ -363,22 +184,16 @@ def process_single_stock(stock_info, days_input, filter_signal):
 # 主界面
 st.subheader("🔍 全市场股票筛选")
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    days_input = st.number_input("数据天数", min_value=30, max_value=365, value=100)
+    days_input = st.number_input("数据天数", min_value=30, max_value=365, value=100, help="建议100天以上")
 
 with col2:
-    filter_signal = st.selectbox(
-        "筛选条件",
-        ["所有符合策略的股票", "即将买入（1-2天内）", "即将卖出（1-2天内）", "当前持有", "当前空仓"]
-    )
+    max_stocks = st.number_input("最大扫描数量", min_value=10, max_value=2000, value=500, help="扫描股票数量")
 
 with col3:
-    max_stocks = st.number_input("最大扫描数量", min_value=10, max_value=1000, value=200, help="扫描股票数量")
-
-with col4:
-    thread_count = st.number_input("线程数", min_value=1, max_value=20, value=10, help="线程越多速度越快，但消耗资源越多")
+    thread_count = st.number_input("线程数", min_value=1, max_value=20, value=10, help="线程越多速度越快")
 
 # 开始扫描按钮
 if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
@@ -415,7 +230,7 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
         with ThreadPoolExecutor(max_workers=thread_count) as executor:
             # 提交所有任务
             future_to_stock = {
-                executor.submit(process_single_stock, stock, days_input, filter_signal): stock 
+                executor.submit(process_single_stock, stock, days_input): stock 
                 for stock in valid_stocks
             }
             
@@ -442,9 +257,13 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
         
         # 显示结果
         if len(results) > 0:
-            st.success(f"✅ 扫描完成！耗时 {elapsed_time:.1f} 秒，找到 {len(results)} 只符合条件的股票（扫描了{total_stocks}只）")
+            st.success(f"✅ 扫描完成！耗时 {elapsed_time:.1f} 秒，找到 {len(results)} 只连板回调14天的股票（共扫描{total_stocks}只）")
             
             result_df = pd.DataFrame(results)
+            
+            # 按回调天数排序（刚好14天的排在前面）
+            result_df['回调天数_int'] = result_df['回调天数']
+            result_df = result_df.sort_values('回调天数_int')
             
             # 统计信息
             st.subheader("📊 筛选结果统计")
@@ -453,22 +272,22 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
             with col1:
                 st.metric("符合条件", len(results))
             with col2:
-                hold_count = len(result_df[result_df['当前状态'] == '持有'])
-                st.metric("当前持有", hold_count)
+                avg_callback = result_df['回调天数'].mean()
+                st.metric("平均回调天数", f"{avg_callback:.1f}天")
             with col3:
-                buy_soon = len(result_df[result_df['下一信号'].str.contains('买入')])
-                st.metric("即将买入", buy_soon)
+                avg_lianban = result_df['连板天数'].mean()
+                st.metric("平均连板天数", f"{avg_lianban:.1f}天")
             with col4:
-                sell_soon = len(result_df[result_df['下一信号'] == '卖出'])
-                st.metric("即将卖出", sell_soon)
+                low_risk = len(result_df[result_df['风险等级'] == '低'])
+                st.metric("低风险股票", low_risk)
             with col5:
                 st.metric("扫描耗时", f"{elapsed_time:.1f}秒")
             
             # 显示结果表格
-            st.subheader("📋 股票列表")
+            st.subheader("📋 股票列表（按回调天数排序）")
             
             # 显示表格
-            display_df = result_df[['股票代码', '股票名称', '最新价格', '当前状态', '操作建议', '下一信号', '倒计时', '风险等级', '策略说明']]
+            display_df = result_df[['股票代码', '股票名称', '连板天数', '连板日期', '连板最高价', '当前价格', '回调天数', '回调幅度', '风险等级']]
             st.dataframe(display_df, use_container_width=True, height=600)
             
             # 下载按钮
@@ -476,7 +295,7 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
             st.download_button(
                 label="📥 下载结果（CSV）",
                 data=csv,
-                file_name=f"stock_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"lianban_callback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
             
@@ -484,21 +303,38 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
             col1, col2 = st.columns(2)
             
             with col1:
-                with st.expander("📈 风险等级分布"):
-                    risk_counts = result_df['风险等级'].value_counts()
-                    fig = go.Figure(data=[go.Pie(labels=risk_counts.index, values=risk_counts.values)])
-                    fig.update_layout(title="风险等级分布")
+                with st.expander("📈 回调幅度分布"):
+                    # 将回调幅度转换为数字
+                    callback_rates = result_df['回调幅度'].str.replace('%', '').astype(float)
+                    fig = go.Figure(data=[go.Histogram(x=callback_rates, nbinsx=20)])
+                    fig.update_layout(
+                        title="回调幅度分布",
+                        xaxis_title="回调幅度 (%)",
+                        yaxis_title="股票数量"
+                    )
                     st.plotly_chart(fig, use_container_width=True)
             
             with col2:
-                with st.expander("📊 操作建议分布"):
-                    action_counts = result_df['操作建议'].value_counts()
-                    fig = go.Figure(data=[go.Bar(x=action_counts.index, y=action_counts.values)])
-                    fig.update_layout(title="操作建议分布", xaxis_title="建议", yaxis_title="数量")
+                with st.expander("📊 连板天数分布"):
+                    lianban_counts = result_df['连板天数'].value_counts().sort_index()
+                    fig = go.Figure(data=[go.Bar(x=lianban_counts.index, y=lianban_counts.values)])
+                    fig.update_layout(
+                        title="连板天数分布",
+                        xaxis_title="连板天数",
+                        yaxis_title="股票数量"
+                    )
                     st.plotly_chart(fig, use_container_width=True)
             
+            # 重点关注：刚好14-15天的股票
+            st.subheader("⭐ 重点关注（回调14-15天）")
+            focus_df = result_df[(result_df['回调天数'] >= 14) & (result_df['回调天数'] <= 15)]
+            if len(focus_df) > 0:
+                st.dataframe(focus_df[['股票代码', '股票名称', '连板天数', '连板日期', '当前价格', '回调幅度', '风险等级']], use_container_width=True)
+            else:
+                st.info("暂无刚好回调14-15天的股票")
+            
         else:
-            st.warning(f"⚠️ 未找到符合条件的股票（耗时{elapsed_time:.1f}秒），请调整筛选条件或增加扫描数量")
+            st.warning(f"⚠️ 未找到符合条件的股票（耗时{elapsed_time:.1f}秒），请增加扫描数量或调整数据天数")
             
     except Exception as e:
         st.error(f"❌ 扫描失败: {str(e)}")
@@ -509,10 +345,15 @@ if st.button("🚀 开始全市场扫描（多线程加速）", type="primary"):
 st.markdown("---")
 st.markdown("""
 💡 **使用说明**: 
-- 选择数据天数和筛选条件
-- 调整线程数（推荐5-10个，线程越多速度越快）
-- 点击"开始全市场扫描"自动分析所有A股
-- 系统自动剔除ST股票和北交所股票
-- 使用多线程并发处理，大幅提升扫描速度⚡
-- 扫描完成后可下载结果CSV文件
+- **策略核心**：筛选出现连板后回调满14天的个股
+- **数据天数**：建议100天以上，以捕捉更多连板机会
+- **线程数**：推荐5-10个，线程越多速度越快⚡
+- **重点关注**：刚好回调14-15天的股票，可能是最佳介入时机
+- **风险提示**：连板股波动较大，注意风险控制
+
+**策略逻辑**：
+1. 寻找历史出现过连板（≥2个涨停）的股票
+2. 从连板高点回调满14个交易日
+3. 回调期间未再次涨停
+4. 适合寻找超跌反弹和二次启动机会
 """)
