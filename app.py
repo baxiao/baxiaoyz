@@ -4,10 +4,11 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import akshare as ak
+import time
 
 st.set_page_config(page_title="连板回调交易策略", layout="wide")
 
-st.title("📈 连板回调交易策略分析")
+st.title("📈 连板回调交易策略 - 全市场扫描")
 st.markdown("---")
 
 # 侧边栏配置
@@ -34,15 +35,15 @@ st.sidebar.markdown("""
 def is_valid_stock(stock_code, stock_name):
     """检查股票是否符合条件"""
     if 'ST' in stock_name or 'st' in stock_name:
-        return False, "ST股票"
+        return False
     
     if stock_code.startswith('8') or stock_code.startswith('4'):
-        return False, "北交所股票"
+        return False
     
     if not (stock_code.startswith('6') or stock_code.startswith('0') or stock_code.startswith('3')):
-        return False, "非A股"
+        return False
     
-    return True, "有效"
+    return True
 
 def get_stock_data(stock_code, days=100):
     """获取股票数据"""
@@ -50,7 +51,7 @@ def get_stock_data(stock_code, days=100):
         df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", adjust="qfq")
         
         if df is None or len(df) == 0:
-            return None, "无法获取数据"
+            return None
         
         df = df.tail(days)
         
@@ -61,9 +62,9 @@ def get_stock_data(stock_code, days=100):
         
         df = df[['日期', '收盘价']].copy()
         
-        return df, "成功"
+        return df
     except Exception as e:
-        return None, f"获取失败: {str(e)}"
+        return None
 
 def analyze_strategy(df):
     """分析交易策略"""
@@ -194,272 +195,288 @@ def generate_prediction(result_df):
     if current_stage == 0:
         days_passed = len(result_df)
         days_left = max(0, 14 - days_passed)
-        prediction['action'] = '⏳ 等待观察'
-        prediction['reason'] = f'策略尚未启动，还需等待 {days_left} 天'
-        prediction['next_signal'] = '首次买入信号'
+        prediction['action'] = '等待观察'
+        prediction['reason'] = f'还需等待{days_left}天'
+        prediction['next_signal'] = '首次买入'
         prediction['countdown'] = days_left
         prediction['risk_level'] = '低'
         
     elif current_stage == 1 and current_position == '持有':
         needed = 3 - red_count
         if current_color == '红':
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = f'已连续 {red_count} 红，再有 {needed} 红将触发卖出'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = f'已{red_count}红，再{needed}红卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = needed
             prediction['risk_level'] = '中' if red_count >= 2 else '低'
         else:
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = '等待连续3红出现以触发卖出信号'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = '等待3红卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = 3
             prediction['risk_level'] = '低'
             
     elif current_stage == 2 and current_position == '空仓':
         needed = 2 - green_count
         if current_color == '绿':
-            prediction['action'] = '⏳ 准备买入'
-            prediction['reason'] = f'已连续 {green_count} 阴，再有 {needed} 阴将触发买入'
-            prediction['next_signal'] = '买入信号'
+            prediction['action'] = '准备买入'
+            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
+            prediction['next_signal'] = '买入'
             prediction['countdown'] = needed
             prediction['risk_level'] = '低'
         else:
-            prediction['action'] = '⏳ 等待回调'
-            prediction['reason'] = '等待连续2阴出现以触发买入信号'
-            prediction['next_signal'] = '买入信号'
+            prediction['action'] = '等待回调'
+            prediction['reason'] = '等待2阴买入'
+            prediction['next_signal'] = '买入'
             prediction['countdown'] = 2
             prediction['risk_level'] = '低'
             
     elif current_stage == 3 and current_position == '持有':
         needed = 3 - red_count
         if current_color == '红':
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = f'第二轮持有，已连续 {red_count} 红，再有 {needed} 红将卖出'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = f'已{red_count}红，再{needed}红卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = needed
             prediction['risk_level'] = '中' if red_count >= 2 else '低'
         else:
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = '等待连续3红触发第二次卖出'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = '等待3红卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = 3
             prediction['risk_level'] = '低'
             
     elif current_stage == 4 and current_position == '空仓':
         needed = 7 - green_count
         if current_color == '绿':
-            prediction['action'] = '⏳ 准备买入'
-            prediction['reason'] = f'已连续 {green_count} 阴，再有 {needed} 阴将触发第三次买入'
-            prediction['next_signal'] = '买入信号'
+            prediction['action'] = '准备买入'
+            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
+            prediction['next_signal'] = '买入'
             prediction['countdown'] = needed
             prediction['risk_level'] = '低'
         else:
-            prediction['action'] = '⏳ 等待深度回调'
-            prediction['reason'] = '等待连续7阴出现以触发第三次买入'
-            prediction['next_signal'] = '买入信号'
+            prediction['action'] = '等待回调'
+            prediction['reason'] = '等待7阴买入'
+            prediction['next_signal'] = '买入'
             prediction['countdown'] = 7
             prediction['risk_level'] = '低'
             
     elif current_stage == 5 and current_position == '持有':
         needed = 7 - red_count
         if current_color == '红':
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = f'第三轮持有，已连续 {red_count} 阳，再有 {needed} 阳将卖出'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = f'已{red_count}阳，再{needed}阳卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = needed
             prediction['risk_level'] = '高' if red_count >= 5 else '中'
         else:
-            prediction['action'] = '🟢 继续持有'
-            prediction['reason'] = '等待连续7阳触发第三次卖出'
-            prediction['next_signal'] = '卖出信号'
+            prediction['action'] = '继续持有'
+            prediction['reason'] = '等待7阳卖出'
+            prediction['next_signal'] = '卖出'
             prediction['countdown'] = 7
             prediction['risk_level'] = '中'
             
     elif current_stage == 6 and current_position == '空仓':
         needed = 14 - green_count
         if current_color == '绿':
-            prediction['action'] = '⏳ 准备最后买入'
-            prediction['reason'] = f'已连续 {green_count} 阴，再有 {needed} 阴将触发最后买入'
-            prediction['next_signal'] = '最后买入信号'
+            prediction['action'] = '准备买入'
+            prediction['reason'] = f'已{green_count}阴，再{needed}阴买入'
+            prediction['next_signal'] = '最后买入'
             prediction['countdown'] = needed
             prediction['risk_level'] = '低'
         else:
-            prediction['action'] = '⏳ 等待极端回调'
-            prediction['reason'] = '等待连续14阴出现以触发最后买入'
-            prediction['next_signal'] = '最后买入信号'
+            prediction['action'] = '等待回调'
+            prediction['reason'] = '等待14阴买入'
+            prediction['next_signal'] = '最后买入'
             prediction['countdown'] = 14
             prediction['risk_level'] = '低'
             
     elif current_stage == 7:
-        prediction['action'] = '🟢 持有至策略结束'
-        prediction['reason'] = '策略已完成所有阶段，建议持有或根据自身判断离场'
+        prediction['action'] = '持有'
+        prediction['reason'] = '策略完成'
         prediction['next_signal'] = '无'
         prediction['countdown'] = 0
         prediction['risk_level'] = '自定义'
     
     return prediction
 
-# 主界面 - 股票代码输入
-st.subheader("🔍 输入股票代码")
+# 主界面
+st.subheader("🔍 全市场股票筛选")
 
-col1, col2 = st.columns([3, 1])
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    stock_code = st.text_input(
-        "股票代码（6位数字）", 
-        placeholder="例如: 000001, 600519, 300750",
-        help="输入沪深A股代码，自动剔除ST和北交所股票"
-    )
-
-with col2:
     days_input = st.number_input("数据天数", min_value=30, max_value=365, value=100)
 
-# 分析按钮
-if st.button("🚀 开始分析", type="primary"):
-    if stock_code:
-        if not stock_code.isdigit() or len(stock_code) != 6:
-            st.error("❌ 请输入正确的6位股票代码")
-        else:
-            with st.spinner("正在获取股票数据..."):
+with col2:
+    filter_signal = st.selectbox(
+        "筛选条件",
+        ["所有符合策略的股票", "即将买入（1-2天内）", "即将卖出（1-2天内）", "当前持有", "当前空仓"]
+    )
+
+with col3:
+    max_stocks = st.number_input("最大扫描数量", min_value=10, max_value=500, value=100, help="扫描股票数量越多，耗时越长")
+
+# 开始扫描按钮
+if st.button("🚀 开始全市场扫描", type="primary"):
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
+        # 获取A股列表
+        status_text.text("正在获取A股列表...")
+        stock_list = ak.stock_zh_a_spot_em()
+        
+        # 筛选有效股票
+        valid_stocks = []
+        for idx, row in stock_list.iterrows():
+            code = row['代码']
+            name = row['名称']
+            if is_valid_stock(code, name):
+                valid_stocks.append({'代码': code, '名称': name})
+        
+        # 限制扫描数量
+        valid_stocks = valid_stocks[:max_stocks]
+        total_stocks = len(valid_stocks)
+        
+        status_text.text(f"找到 {total_stocks} 只有效股票，开始分析...")
+        
+        # 扫描股票
+        results = []
+        
+        for i, stock in enumerate(valid_stocks):
+            code = stock['代码']
+            name = stock['名称']
+            
+            progress_bar.progress((i + 1) / total_stocks)
+            status_text.text(f"正在分析 {i+1}/{total_stocks}: {code} {name}")
+            
+            # 获取股票数据
+            df_stock = get_stock_data(code, days_input)
+            
+            if df_stock is not None and len(df_stock) >= 15:
                 try:
-                    stock_info = ak.stock_individual_info_em(symbol=stock_code)
-                    stock_name = stock_info[stock_info['item'] == '股票简称']['value'].values[0]
+                    # 分析策略
+                    result_df = analyze_strategy(df_stock)
+                    prediction = generate_prediction(result_df)
+                    
+                    # 获取最新价格
+                    latest_price = result_df.iloc[-1]['收盘价']
+                    latest_date = result_df.iloc[-1]['日期']
+                    
+                    # 根据筛选条件过滤
+                    should_add = False
+                    
+                    if filter_signal == "所有符合策略的股票":
+                        should_add = True
+                    elif filter_signal == "即将买入（1-2天内）":
+                        if prediction['next_signal'] in ['买入', '首次买入', '最后买入'] and prediction['countdown'] <= 2:
+                            should_add = True
+                    elif filter_signal == "即将卖出（1-2天内）":
+                        if prediction['next_signal'] == '卖出' and prediction['countdown'] <= 2:
+                            should_add = True
+                    elif filter_signal == "当前持有":
+                        if prediction['position'] == '持有':
+                            should_add = True
+                    elif filter_signal == "当前空仓":
+                        if prediction['position'] == '空仓':
+                            should_add = True
+                    
+                    if should_add:
+                        results.append({
+                            '股票代码': code,
+                            '股票名称': name,
+                            '最新价格': f"{latest_price:.2f}",
+                            '当前状态': prediction['position'],
+                            '操作建议': prediction['action'],
+                            '下一信号': prediction['next_signal'],
+                            '倒计时': f"{prediction['countdown']}天" if prediction['countdown'] > 0 else "已完成",
+                            '风险等级': prediction['risk_level'],
+                            '策略说明': prediction['reason'],
+                            '阶段': prediction['stage'],
+                            '更新日期': latest_date
+                        })
                 except:
-                    stock_name = "未知"
-                
-                is_valid, reason = is_valid_stock(stock_code, stock_name)
-                
-                if not is_valid:
-                    st.error(f"❌ {stock_code} {stock_name} 不符合筛选条件：{reason}")
+                    pass
+            
+            # 控制请求频率
+            time.sleep(0.1)
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        # 显示结果
+        if len(results) > 0:
+            st.success(f"✅ 扫描完成！找到 {len(results)} 只符合条件的股票")
+            
+            result_df = pd.DataFrame(results)
+            
+            # 统计信息
+            st.subheader("📊 筛选结果统计")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("符合条件股票", len(results))
+            with col2:
+                hold_count = len(result_df[result_df['当前状态'] == '持有'])
+                st.metric("当前持有", hold_count)
+            with col3:
+                buy_soon = len(result_df[result_df['下一信号'].str.contains('买入')])
+                st.metric("即将买入", buy_soon)
+            with col4:
+                sell_soon = len(result_df[result_df['下一信号'] == '卖出'])
+                st.metric("即将卖出", sell_soon)
+            
+            # 显示结果表格
+            st.subheader("📋 股票列表")
+            
+            # 按风险等级着色
+            def highlight_risk(row):
+                if row['风险等级'] == '高':
+                    return ['background-color: #ffcccc'] * len(row)
+                elif row['风险等级'] == '中':
+                    return ['background-color: #fff4cc'] * len(row)
+                elif row['风险等级'] == '低':
+                    return ['background-color: #ccffcc'] * len(row)
                 else:
-                    st.info(f"✅ {stock_code} {stock_name} - 符合条件，正在分析...")
-                    
-                    df_stock, status = get_stock_data(stock_code, days_input)
-                    
-                    if df_stock is None:
-                        st.error(f"❌ 获取股票数据失败: {status}")
-                    else:
-                        result_df = analyze_strategy(df_stock)
-                        prediction = generate_prediction(result_df)
-                        
-                        st.success(f"✅ 分析完成！股票: {stock_code} {stock_name}")
-                        
-                        # 预测和建议区域
-                        st.subheader("🎯 策略预测与交易建议")
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("当前操作建议", prediction['action'])
-                        with col2:
-                            st.metric("下一个信号", prediction['next_signal'])
-                        with col3:
-                            if prediction['countdown'] > 0:
-                                st.metric("距离信号", f"{prediction['countdown']} 个交易日")
-                            else:
-                                st.metric("距离信号", "已完成")
-                        with col4:
-                            risk_color = {
-                                '低': '🟢',
-                                '中': '🟡', 
-                                '高': '🔴',
-                                '自定义': '⚪'
-                            }
-                            st.metric("风险等级", f"{risk_color.get(prediction['risk_level'], '')} {prediction['risk_level']}")
-                        
-                        # 详细建议
-                        st.info(f"📋 **策略分析**: {prediction['reason']}")
-                        
-                        # 当前状态说明
-                        stage_names = {
-                            0: "初始观察期",
-                            1: "第一轮持仓期",
-                            2: "第一次回调期",
-                            3: "第二轮持仓期",
-                            4: "第二次回调期",
-                            5: "第三轮持仓期",
-                            6: "第三次回调期",
-                            7: "策略完成期"
-                        }
-                        
-                        st.markdown(f"**当前阶段**: {stage_names.get(prediction['stage'], '未知')} (阶段 {prediction['stage']})")
-                        st.markdown(f"**持仓状态**: {prediction['position']}")
-                        
-                        # 显示结果
-                        st.subheader("📊 交易信号详情")
-                        
-                        signals_only = result_df[result_df['信号'] != '']
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("股票代码", stock_code)
-                        with col2:
-                            buy_count = len(signals_only[signals_only['信号'] == '买入'])
-                            st.metric("买入次数", buy_count)
-                        with col3:
-                            sell_count = len(signals_only[signals_only['信号'] == '卖出'])
-                            st.metric("卖出次数", sell_count)
-                        with col4:
-                            final_position = result_df.iloc[-1]['持仓']
-                            st.metric("当前状态", final_position)
-                        
-                        if len(signals_only) > 0:
-                            st.dataframe(signals_only[['日期', '收盘价', '红绿', '信号', '持仓']], use_container_width=True)
-                        else:
-                            st.info("暂无交易信号")
-                        
-                        # 绘制价格走势图
-                        st.subheader("📈 价格走势与交易信号")
-                        
-                        fig = go.Figure()
-                        
-                        fig.add_trace(go.Scatter(
-                            x=result_df['日期'],
-                            y=result_df['收盘价'],
-                            mode='lines',
-                            name='收盘价',
-                            line=dict(color='blue', width=2)
-                        ))
-                        
-                        buy_signals = result_df[result_df['信号'] == '买入']
-                        if len(buy_signals) > 0:
-                            fig.add_trace(go.Scatter(
-                                x=buy_signals['日期'],
-                                y=buy_signals['收盘价'],
-                                mode='markers',
-                                name='买入',
-                                marker=dict(color='green', size=12, symbol='triangle-up')
-                            ))
-                        
-                        sell_signals = result_df[result_df['信号'] == '卖出']
-                        if len(sell_signals) > 0:
-                            fig.add_trace(go.Scatter(
-                                x=sell_signals['日期'],
-                                y=sell_signals['收盘价'],
-                                mode='markers',
-                                name='卖出',
-                                marker=dict(color='red', size=12, symbol='triangle-down')
-                            ))
-                        
-                        fig.update_layout(
-                            title=f"{stock_code} {stock_name} - 股票价格与交易信号",
-                            xaxis_title="日期",
-                            yaxis_title="价格",
-                            hovermode='x unified',
-                            height=500
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        with st.expander("📋 查看完整数据"):
-                            st.dataframe(result_df, use_container_width=True)
-    else:
-        st.warning("⚠️ 请输入股票代码")
+                    return [''] * len(row)
+            
+            # 显示表格
+            display_df = result_df[['股票代码', '股票名称', '最新价格', '当前状态', '操作建议', '下一信号', '倒计时', '风险等级', '策略说明']]
+            st.dataframe(display_df, use_container_width=True, height=600)
+            
+            # 下载按钮
+            csv = result_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📥 下载结果（CSV）",
+                data=csv,
+                file_name=f"stock_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+            
+            # 详细图表
+            with st.expander("📈 查看风险分布"):
+                risk_counts = result_df['风险等级'].value_counts()
+                fig = go.Figure(data=[go.Pie(labels=risk_counts.index, values=risk_counts.values)])
+                fig.update_layout(title="风险等级分布")
+                st.plotly_chart(fig, use_container_width=True)
+            
+        else:
+            st.warning("⚠️ 未找到符合条件的股票，请调整筛选条件或增加扫描数量")
+            
+    except Exception as e:
+        st.error(f"❌ 扫描失败: {str(e)}")
+        progress_bar.empty()
+        status_text.empty()
 
 # 页脚
 st.markdown("---")
 st.markdown("""
 💡 **使用说明**: 
-- 输入6位A股股票代码（如000001、600519）
+- 选择数据天数和筛选条件
+- 点击"开始全市场扫描"自动分析所有A股
 - 系统自动剔除ST股票和北交所股票
-- 点击'开始分析'查看交易策略的买卖信号和预测建议
+- 扫描完成后可下载结果CSV文件
+- ⚠️ 扫描数量越多耗时越长，建议从100只开始测试
 """)
